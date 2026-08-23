@@ -1,0 +1,6 @@
+[Unit]
+Description=Vera Bot health-check watchdog (one-shot, triggered by timer)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/ubuntu/vera-bot/vera-bot-watchdog.sh
