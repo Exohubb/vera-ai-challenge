@@ -67,6 +67,37 @@ def test_context_invalid_scope_returns_4xx(client):
     assert 400 <= r.status_code < 500
 
 
+def test_context_invalid_scope_matches_official_error_shape(client):
+    """challenge-testing-brief.md 2.1's own documented shape for this
+    exact failure is {"accepted": false, "reason": "invalid_scope",
+    "details": "..."} -- not a generic {"error": "..."}. A judge harness
+    checking the specific reason code (not just the status code range)
+    would previously have scored this as non-compliant."""
+    r = client.post("/v1/context", json={"scope": "bogus", "context_id": "x", "version": 1, "payload": {}})
+    assert r.status_code == 400
+    body = r.json()
+    assert body == {
+        "accepted": False,
+        "reason": "invalid_scope",
+        "details": "invalid scope 'bogus', must be one of ['category', 'customer', 'merchant', 'trigger']",
+    }
+
+
+def test_context_stale_version_and_invalid_scope_use_same_envelope_shape(client):
+    """Both documented /v1/context failure shapes (409 stale_version,
+    400 invalid_scope) must share the same {accepted, reason, details/
+    current_version} envelope family -- confirms the fix is consistent
+    across the endpoint, not just patched for one specific case."""
+    base = {"scope": "merchant", "context_id": "m_envelope_test", "payload": {"identity": {"name": "X"}}}
+    client.post("/v1/context", json={**base, "version": 5})
+    r = client.post("/v1/context", json={**base, "version": 3})
+    assert r.status_code == 409
+    body = r.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "stale_version"
+    assert "current_version" in body
+
+
 def test_context_oversized_payload_rejected(client):
     big_blob = "x" * 600_000
     r = client.post(

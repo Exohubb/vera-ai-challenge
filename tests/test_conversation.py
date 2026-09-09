@@ -108,3 +108,57 @@ def test_engaged_intent_catches_imperative_rephrasing():
     )
     assert result["intent"] == "engaged"
     assert result["action"] == "send"
+
+
+def test_bare_stop_keyword_is_a_hard_opt_out():
+    """challenge-brief.md section 3 specifies Vera's CTAs as a "binary choice
+    (YES/STOP)" -- Vera itself tells merchants to reply STOP. Every
+    _OPT_OUT_PATTERNS entry required "stop" plus a second word ("stop
+    messaging", "please stop", "stop sending"), so a message of exactly
+    "STOP" matched none of them and fell through to the generic
+    "no clear signal -> wait" branch. Verified live against the deployed
+    service before the fix: "STOP" -> action=wait (conversation left open,
+    merchant left un-suppressed), while "Stop messaging me" correctly ended.
+    """
+    from conversation import _is_bare_opt_out
+
+    for text in ["STOP", "stop", "Stop", "STOP.", " stop ", "STOP!", "stop all",
+                 "unsubscribe", "UNSUB", "opt out", "opt-out", "optout", "quit", "revoke"]:
+        assert _is_bare_opt_out(text) is True, f"{text!r} must be treated as a hard opt-out"
+
+
+def test_bare_opt_out_does_not_misfire_on_ambiguous_or_embedded_text():
+    from conversation import _is_bare_opt_out
+
+    # Substring matches must not fire -- the opposite meaning.
+    assert _is_bare_opt_out("don't stop sending these") is False
+    assert _is_bare_opt_out("please don't stop") is False
+    # Ambiguous single words: suppressing a merchant for 30 days on either of
+    # these would be much worse than missing an opt-out.
+    assert _is_bare_opt_out("no") is False
+    assert _is_bare_opt_out("cancel") is False
+    # Normal replies.
+    assert _is_bare_opt_out("yes please send it") is False
+    assert _is_bare_opt_out("") is False
+    assert _is_bare_opt_out(None) is False
+
+
+def test_bare_stop_ends_conversation_and_suppresses_merchant():
+    """End-to-end through the real conversation manager, not just the helper."""
+    import uuid
+
+    from conversation import ConversationManager
+
+    manager = ConversationManager()
+    merchant_id = f"m_test_bare_stop_{uuid.uuid4().hex[:8]}"
+
+    result = manager.handle_reply(
+        conversation_id=f"conv_bare_stop_{uuid.uuid4().hex[:8]}",
+        merchant_id=merchant_id,
+        from_role="merchant",
+        message="STOP",
+        turn_number=1,
+    )
+    assert result["action"] == "end"
+    assert result["intent"] == "opt_out"
+    assert manager.suppression.is_merchant_suppressed(merchant_id) is True
