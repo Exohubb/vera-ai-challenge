@@ -18,6 +18,23 @@ import json
 
 from trigger_router import Strategy
 
+
+def _voice_line(style: dict) -> str:
+    """Renders the category voice block for the prompt. Folds in
+    vocab_allowed and tone_examples when the pushed CategoryContext
+    actually supplied them (real dataset shape, category_styles.py) --
+    these give the model concrete, category-specific worked examples of
+    register instead of a single generic tone adjective, which is a
+    meaningfully stronger signal for Category Fit than tone alone."""
+    line = f"CATEGORY VOICE: tone={style.get('tone', 'neutral, professional')}; banned_phrases={json.dumps(style.get('banned_phrases', []))}"
+    vocab_allowed = style.get("vocab_allowed") or []
+    if vocab_allowed:
+        line += f"; vocab_allowed={json.dumps(vocab_allowed)}"
+    tone_examples = style.get("tone_examples") or []
+    if tone_examples:
+        line += f"; tone_examples={json.dumps(tone_examples)}"
+    return line
+
 SYSTEM_PROMPT = """You are Vera, magicpin's AI growth assistant for merchants across India. You \
 message small business owners on WhatsApp on magicpin's behalf -- and, when explicitly given \
 customer context, you sometimes message their end customers directly. You operate at production \
@@ -116,6 +133,15 @@ favor of a lower-quality fallback. So:
   not invent one. State the number you do have on its own.
 - Never round, adjust, or "clean up" a real number from context (₹24999 stays 24999, not 25000; 190 \
   stays 190, not "about 200").
+- Never invent a specific clock time, date, or slot for an appointment/booking/reminder unless that \
+  exact time/date appears verbatim in the context you were given (e.g. in a slot list, a due-date \
+  field, or a booking record). If the trigger tells you an appointment/event is happening (e.g. \
+  "tomorrow") but gives you no actual time, do not guess a plausible-sounding time ("7am", "6:30pm") to \
+  make the message feel more concrete -- either omit the time and ask the recipient to confirm/share \
+  it, or ground the message in whatever other real detail you do have (their name, the relationship, \
+  the offer). This is mechanically checked exactly like the numeric-claims rule: any clock time in \
+  your message that isn't a verbatim substring somewhere in the context fails the check regardless of \
+  whether some unrelated digit happens to also appear in the context.
 
 =====================================================================
 NEVER INVENT A URL
@@ -186,6 +212,12 @@ STYLE, TONE, AND LANGUAGE
 - Match the CATEGORY VOICE tone you were given exactly (e.g. clinical and reassuring vs. visual and \
   upbeat vs. utility-first) -- don't default to one generic "friendly marketer" voice across every \
   category.
+- When CATEGORY VOICE includes a vocab_allowed list, prefer that real domain vocabulary over generic \
+  phrasing wherever it fits naturally (e.g. "fluoride varnish", "occlusion" for dentists) -- this is \
+  the strongest, most concrete signal of genuine category fit versus a generic marketer tone.
+- When CATEGORY VOICE includes tone_examples, treat them as calibration for register and length, not \
+  as text to copy -- your own message must be original wording grounded in this specific merchant's \
+  own context, never a close paraphrase of an example.
 - Never use any phrase on the category's banned_phrases list, in any form (singular/plural, with \
   punctuation, capitalized or not).
 - Language selection is driven strictly by MERCHANT CONTEXT identity.languages, not by category or \
@@ -300,7 +332,7 @@ def build_user_message(
     LLM's job is wording, not re-deciding strategy)."""
     parts = [
         f"CATEGORY: {category}",
-        f"CATEGORY VOICE: tone={style['tone']}; banned_phrases={json.dumps(style['banned_phrases'])}",
+        _voice_line(style),
         f"MERCHANT CONTEXT (JSON, only source of merchant facts): {json.dumps(merchant_payload)}",
         f"TRIGGER (why you're messaging now): {json.dumps(trigger)}",
         f"REQUIRED LEVER FOR THIS TRIGGER: {strategy.lever}",
@@ -384,8 +416,7 @@ def build_reply_user_message(
     parts = [
         f"CLASSIFIED INTENT FOR THIS REPLY: {intent}",
         f"WHAT THEY JUST SAID: {json.dumps(incoming_message)}",
-        f"CATEGORY VOICE: tone={style.get('tone', 'neutral, professional')}; "
-        f"banned_phrases={json.dumps(style.get('banned_phrases', []))}",
+        _voice_line(style),
     ]
     if merchant_payload:
         parts.append(f"MERCHANT CONTEXT (only source of merchant facts): {json.dumps(merchant_payload)}")
