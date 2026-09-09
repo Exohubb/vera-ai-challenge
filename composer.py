@@ -43,7 +43,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from category_styles import get_category_style, violates_banned_phrases
-from fact_check import count_ctas, find_urls, verify_numeric_claims
+from fact_check import (
+    count_ctas,
+    find_fabricated_clock_times,
+    find_new_customer_offer_mismatch,
+    find_unsupported_appointment_assertion,
+    find_urls,
+    verify_numeric_claims,
+)
 from fallback import compose_fallback, compose_reply_grounded_fallback
 from offers import find_category_offer_leakage, format_offer, normalize_merchant_offers, select_relevant_offer
 from state_backend import StateBackend
@@ -160,6 +167,49 @@ def _get_bedrock_client():
         logger.info("bedrock client unavailable, will use deterministic fallback: %s", exc)
         _bedrock_init_failed = True
         return None
+
+
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_lone_surrogates(text: str) -> str:
+    """Defensive last line of defense against a real, live-repro'd crash:
+    a lone Unicode surrogate character anywhere in a composed message
+    body reaches FastAPI's JSONResponse.render(), which calls
+    `.encode("utf-8")` on the full response payload -- and UTF-8 cannot
+    represent a lone surrogate (they only mean anything as a matched
+    high+low pair in UTF-16). The result is an unhandled
+    UnicodeEncodeError deep inside Starlette's response renderer, which
+    crashes the ENTIRE /v1/tick response with a 500 -- taking down every
+    other action in the same batch along with the one bad message, not
+    just the offending action.
+
+    Confirmed root cause via a real production incident: composing 30
+    real canonical test-pair triggers in one tick hit a deterministic
+    fallback.py template that used a Python string literal with two
+    adjacent `\\uXXXX` escapes in the surrogate range (e.g.
+    "\\ud83d\\udc4b" for the "waving hand" emoji). Unlike JSON or
+    JavaScript, Python does NOT combine two adjacent `\\u` surrogate
+    escapes in a source-code string literal into one emoji codepoint --
+    it keeps them as two separate, individually-unencodable lone
+    surrogate characters. That specific source bug is now fixed (the
+    literals were rewritten using Python's correct single-codepoint
+    `\\U0001F44B`-style escape), but the SAME failure mode could
+    reappear from Nova's own LLM output too (models occasionally emit a
+    malformed/truncated multi-byte emoji sequence), which this module
+    cannot control at the source. So: strip lone surrogates from every
+    composed body as an unconditional safety net, not just at the one
+    known historical source, so a single bad character in a single
+    message can never again take an entire batch response down with it.
+    """
+    if not isinstance(text, str) or not _LONE_SURROGATE_RE.search(text):
+        return text
+    cleaned = _LONE_SURROGATE_RE.sub("", text)
+    logger.warning(
+        "stripped lone Unicode surrogate(s) from composed text to prevent a UTF-8 encode crash "
+        "(original len=%d, cleaned len=%d)", len(text), len(cleaned),
+    )
+    return cleaned
 
 
 def _parse_nova_text(raw_text: str) -> dict | None:
@@ -320,6 +370,18 @@ def _evaluate_draft(
             f"{', '.join(unverifiable)}. Remove or replace them with only numbers present in the context."
         )
 
+    fabricated_times = find_fabricated_clock_times(body_text, merchant_payload, trigger, customer_payload)
+    if fabricated_times:
+        problems.append(
+            f"Your message states a specific clock time ({', '.join(fabricated_times)}) for this "
+            "recipient's own appointment/slot that isn't actually given anywhere in their merchant, "
+            "trigger, or customer context -- a bare digit matching elsewhere (an unrelated count, "
+            "percentage, or a category-wide research item) does NOT make an invented appointment time "
+            "grounded. If no real time is given anywhere for this specific recipient, do not invent "
+            "one -- ask them to confirm the time, or omit the time and ground the message in whatever "
+            "other real fact/relationship detail IS present instead."
+        )
+
     banned_hits = violates_banned_phrases(body_text, style.get("banned_phrases", []))
     if banned_hits:
         problems.append(
@@ -333,6 +395,31 @@ def _evaluate_draft(
             f"Your message contains a URL ({', '.join(urls)}) that is not present verbatim in the "
             "given context. Never invent or include a URL that wasn't explicitly given to you -- "
             "remove it entirely."
+        )
+
+    invented_appointment = find_unsupported_appointment_assertion(
+        body_text,
+        trigger.get("payload") if isinstance(trigger, dict) else None,
+        customer_payload,
+    )
+    if invented_appointment:
+        problems.append(
+            f"Your message states as fact that this person has a confirmed appointment "
+            f"({', '.join(invented_appointment)}), but no appointment time, date or service appears "
+            "anywhere in the trigger payload, and this customer's own context marks them as lapsed "
+            "or churned -- so they almost certainly have no booking. Do not assert a booking that "
+            "isn't in the context. Offer them an available slot instead (e.g. a slot is open "
+            "tomorrow, shall I hold it for you?)."
+        )
+
+    new_customer_mismatch = find_new_customer_offer_mismatch(body_text, customer_payload)
+    if new_customer_mismatch:
+        problems.append(
+            f"Your message promises an offer restricted to new customers "
+            f"({', '.join(new_customer_mismatch)}), but this recipient's own CUSTOMER CONTEXT shows "
+            "an existing relationship (recorded visits and/or a last-visit date). Telling a returning "
+            "customer they qualify for a new-customer-only deal is factually wrong for them. Either "
+            "cite an offer they're actually eligible for, or drop the eligibility wording entirely."
         )
 
     leaked_offers = find_category_offer_leakage(body_text, merchant_payload, category_payload)
@@ -379,9 +466,9 @@ def _finalize_llm_result(raw: dict, strategy, trigger_kind: str, offer: dict | N
     offer_cited = _offer_is_cited(raw["body"], offer) if offer is not None else False
     final_cta = _expected_cta(strategy, trigger_kind, offer_cited, is_customer_facing)
     return {
-        "body": raw["body"],
+        "body": _strip_lone_surrogates(raw["body"]),
         "cta": final_cta,
-        "rationale": rationale,
+        "rationale": _strip_lone_surrogates(rationale),
     }
 
 
@@ -526,6 +613,8 @@ def _build_fallback_result(trigger_kind: str, trigger: dict, merchant_payload: d
             logger.error("fallback template produced unverifiable numbers: %s", unverifiable)
     except Exception as exc:
         logger.error("fallback verification step itself failed (%s)", exc)
+    fallback_result["body"] = _strip_lone_surrogates(fallback_result["body"])
+    fallback_result["rationale"] = _strip_lone_surrogates(fallback_result.get("rationale", ""))
     return fallback_result
 
 
@@ -566,6 +655,14 @@ def _evaluate_reply_draft(body_text: str, merchant_payload: dict | None, trigger
         problems.append(
             f"These numbers appear in your reply but not verbatim anywhere in the given context: "
             f"{', '.join(unverifiable)}. Remove or replace them with only numbers present in the context."
+        )
+    fabricated_times = find_fabricated_clock_times(body_text, merchant_payload, trigger_payload, customer_payload)
+    if fabricated_times:
+        problems.append(
+            f"Your reply states a specific clock time ({', '.join(fabricated_times)}) for this "
+            "recipient's own appointment/slot that isn't present in their merchant/trigger/customer "
+            "context. Do not invent it -- ask the recipient to confirm it, or ground the reply in "
+            "another real fact instead."
         )
     banned_hits = violates_banned_phrases(body_text, style.get("banned_phrases", []))
     if banned_hits:
@@ -622,6 +719,12 @@ def compose_reply(
     if result is None:
         result = compose_reply_grounded_fallback(intent, incoming_message, merchant_payload, trigger_payload, customer_payload)
 
+    # Belt-and-suspenders: sanitize regardless of which branch produced
+    # `result` (LLM path already sanitizes at its own return point above;
+    # this also covers the fallback branch and any future code path).
+    result["body"] = _strip_lone_surrogates(result.get("body", ""))
+    result["rationale"] = _strip_lone_surrogates(result.get("rationale", ""))
+
     if cache_key is not None and fallback_reason != "transient":
         try:
             _reply_cache.set(cache_key, result)
@@ -652,7 +755,10 @@ def _try_reply_llm_with_correction(intent, incoming_message, merchant_payload, t
         else:
             problems = _evaluate_reply_draft(raw["body"], merchant_payload, trigger_payload, customer_payload, style, category_payload)
             if not problems:
-                return {"body": raw["body"], "rationale": raw.get("rationale") or f"LLM-grounded reply for intent={intent}"}, None
+                return {
+                    "body": _strip_lone_surrogates(raw["body"]),
+                    "rationale": _strip_lone_surrogates(raw.get("rationale") or f"LLM-grounded reply for intent={intent}"),
+                }, None
             logger.info("Nova reply attempt %d failed quality gates: %s", attempt, problems)
 
         if attempt >= LLM_MAX_ATTEMPTS:
