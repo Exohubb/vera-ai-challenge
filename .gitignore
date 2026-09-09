@@ -1,9 +1,21 @@
+# Credentials -- never commit. .env holds Bedrock keys, .judge_env the
+# Gemini key used by the independent-judge harness.
 .env
+.judge_env
+
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
 venv/
+
+# Runtime / operational output
 *.log
 server_out.txt
 test_run_results.txt
 .watchdog_fail_count
+
+# Generated evaluation artifacts. submission.jsonl IS committed (it is a
+# required deliverable); these are just local measurement output.
+gemini_judge_report*.json
+canonical_30_*.json

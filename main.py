@@ -7,6 +7,7 @@ POST /v1/reply.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os as _os
 import time
@@ -45,18 +46,30 @@ _LLM_GROUNDED_REPLY_INTENTS = {"intent_transition", "off_topic", "engaged"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("vera_bot.main")
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.1.4"
 TEAM_NAME = "Airo"
 TEAM_MEMBERS = ["Kapil Meena"]
-MODEL_NAME = "amazon.nova-pro-v1:0 (Bedrock) with deterministic template fallback"
+MODEL_NAME = "amazon.nova-pro-v1:0 via Amazon Bedrock, with a deterministic grounded-template fallback library"
+# Kept accurate against the code on purpose: the strategy table now holds 27
+# kinds (was described as 24 for several releases) and the composer runs six
+# named grounding gates. An approach string that overstates or understates
+# what the service actually does is worse than none.
 APPROACH = (
-    "trigger-router (24 dataset trigger kinds mapped to explicit levers/CTAs) + "
-    "fact-verified composer (numeric-claim, URL, and category-vs-merchant-offer "
-    "verification) + conversation state machine (auto-reply/opt-out/intent-transition) "
-    "+ per-trigger and per-merchant suppression"
+    "Decision-first composition. A 27-kind trigger router resolves lever, CTA type and "
+    "priority in code rather than leaving strategy to the model; a fact resolver then derives "
+    "exactly one verifiable claim from the pushed contexts, and where a trigger payload carries "
+    "no event data it grounds the message in real adjacent signals (7-day performance deltas, "
+    "category peer benchmarks, cumulative customer counts, subscription state, visit history) "
+    "instead of degrading to generic copy. Every model draft must clear six grounding gates "
+    "-- numeric-claim verification, fabricated clock times, invented URLs, category-vs-merchant "
+    "offer leakage, new-customer offer eligibility, and unsupported appointment assertions -- "
+    "plus per-category banned-phrase and single-CTA checks, with one named-correction retry "
+    "before falling back to a deterministic grounded template. Conversations run as a state "
+    "machine (auto-reply escalation, hard opt-out including a bare STOP, intent transition, "
+    "off-topic redirect) with per-trigger and per-merchant suppression enforcing restraint."
 )
 CONTACT_EMAIL = _os.environ.get("TEAM_CONTACT_EMAIL", "kapilmeena30062003@gmail.com")
-SUBMITTED_AT = _os.environ.get("SUBMITTED_AT", "2026-08-30T00:00:00Z")
+SUBMITTED_AT = _os.environ.get("SUBMITTED_AT", "2026-09-10T00:00:00Z")
 
 _start_time = time.monotonic()
 
@@ -113,6 +126,20 @@ if _os.environ.get("VERA_ENV") == "production" and store.backend_name != "redis"
 
 @app.exception_handler(ValidationError)
 async def validation_error_handler(request: Request, exc: ValidationError):
+    if exc.envelope == "context":
+        # Official /v1/context error contract (challenge-testing-
+        # brief.md 2.1): {"accepted": false, "reason": "<code>",
+        # "details": "<message>"} -- e.g. {"accepted": false,
+        # "reason": "invalid_scope", "details": "..."}. Previously every
+        # /v1/context validation failure (including this exact
+        # documented invalid_scope case) returned a generic
+        # {"error": message} instead, which doesn't match the spec's
+        # own worked shape even though the general "return some 4xx"
+        # requirement was met.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"accepted": False, "reason": exc.reason, "details": exc.message},
+        )
     return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
@@ -145,16 +172,33 @@ async def metadata():
 async def post_context(request: Request):
     raw_body = await request.body()
     if len(raw_body) > 500 * 1024:
-        return JSONResponse(status_code=413, content={"error": "payload exceeds 500KB cap"})
+        return JSONResponse(
+            status_code=413,
+            content={"accepted": False, "reason": "payload_too_large", "details": "payload exceeds 500KB cap"},
+        )
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+        return JSONResponse(
+            status_code=400,
+            content={"accepted": False, "reason": "invalid_json", "details": "invalid JSON body"},
+        )
 
     try:
         validate_context_request(body)
     except ValidationError as exc:
-        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+        # /v1/context's own documented error contract (challenge-testing-
+        # brief.md 2.1) is {"accepted": false, "reason": "<code>",
+        # "details": "<message>"} -- not the generic {"error": message}
+        # the top-level @app.exception_handler(ValidationError) uses for
+        # /v1/tick and /v1/reply (which have no such documented envelope).
+        # This route catches ValidationError itself rather than letting it
+        # propagate to that handler, so it must render the same envelope
+        # here explicitly.
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"accepted": False, "reason": exc.reason, "details": exc.message},
+        )
 
     status, record = store.push_context(
         scope=body["scope"],
@@ -381,6 +425,42 @@ def _compose_one_candidate(cand: dict) -> dict:
     }
 
 
+def _is_json_encodable_action(action: dict) -> bool:
+    """Last-resort HTTP-layer safety net against a real production
+    incident: a single composed action containing an unencodable
+    character (a lone Unicode surrogate -- see composer._strip_lone_
+    surrogates for the full root-cause writeup) crashed the ENTIRE
+    /v1/tick response with a 500, silently discarding every other action
+    in the same batch, not just the one bad message. composer.py's
+    compose() now sanitizes body/rationale at the source, so this should
+    never actually trigger -- but per the same "never let one bad item
+    take the whole batch down" principle already applied to the tick-
+    timeout fix (test report §3.3), a defensive final check right before
+    the batch is assembled costs nothing and removes an entire class of
+    future 500s regardless of which upstream code path a bad character
+    might someday slip through from (a template bug not yet written, a
+    genuinely malformed Nova completion, etc). Dropping just the one
+    unencodable action and keeping the rest is strictly better than a
+    total-batch 500 either way."""
+    try:
+        # Must exactly mirror Starlette's own JSONResponse.render(), which
+        # uses ensure_ascii=False -- the default json.dumps(ensure_ascii=
+        # True) instead ESCAPES a lone surrogate as literal "\ud83d\udc4b"
+        # text in the JSON string rather than encoding it as a raw UTF-8
+        # byte sequence, so it would never actually reproduce the crash
+        # this check exists to prevent. ensure_ascii=False is required for
+        # this check to mean anything.
+        json.dumps(action, ensure_ascii=False).encode("utf-8")
+        return True
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        logger.error(
+            "tick: dropping one action (merchant=%s trigger=%s) that failed a final JSON/UTF-8 "
+            "encodability check (%s) -- every OTHER action in this batch is still returned",
+            action.get("merchant_id"), action.get("trigger_id"), exc,
+        )
+        return False
+
+
 @app.post("/v1/tick")
 async def post_tick(request: Request):
     try:
@@ -435,6 +515,7 @@ async def post_tick(request: Request):
 
     raw_results = await asyncio.gather(*(_compose_with_limit(c) for c in candidates))
     composed_actions = [r for r in raw_results if r is not None]
+    composed_actions = [a for a in composed_actions if _is_json_encodable_action(a)]
 
     # Suppression/open-conversation side effects are applied ONLY after
     # every compose() call has returned and the full action list is
@@ -580,4 +661,17 @@ async def post_reply(request: Request):
         # api-call-examples.md 2.5/4.1) always carries wait_seconds on a
         # "wait" action -- previously omitted entirely.
         response["wait_seconds"] = _WAIT_SECONDS_BY_INTENT.get(intent, DEFAULT_WAIT_SECONDS)
+
+    if not _is_json_encodable_action(response):
+        # Same class of incident as the /v1/tick fix above (see
+        # _is_json_encodable_action's docstring) -- a single reply is a
+        # much smaller blast radius than a 20-action tick batch, but the
+        # principle is identical: never let an unencodable character in
+        # one composed body crash this endpoint's whole response with a
+        # 500 when a safe, honest fallback is one line away.
+        response = {
+            "action": "wait",
+            "rationale": "safety fallback: composed reply failed a final encodability check",
+            "wait_seconds": DEFAULT_WAIT_SECONDS,
+        }
     return response
