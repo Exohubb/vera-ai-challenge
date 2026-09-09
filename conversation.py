@@ -47,6 +47,43 @@ _OPT_OUT_PATTERNS = [
     r"stop sending",
 ]
 
+# Standalone opt-out keywords. Every pattern above needs "stop" plus another
+# word ("stop messaging", "please stop"), so a message consisting of just
+# "STOP" matched NONE of them and fell through to the generic "no clear
+# signal -> wait" branch. That is the single most important opt-out token
+# there is: challenge-brief.md section 3 specifies Vera's own CTAs as a
+# "binary choice (YES/STOP)", so Vera literally instructs merchants to
+# reply STOP -- and then ignored it, kept the conversation open, and left
+# the merchant un-suppressed. Verified live against the deployed service
+# before this fix: "STOP" -> action=wait, while "Stop messaging me" and
+# "unsubscribe" both correctly ended.
+#
+# Matched only when the ENTIRE message is the keyword (after stripping
+# punctuation/whitespace), which is the SMS/WhatsApp convention. Matching
+# these substrings anywhere would misfire on "don't stop sending these".
+# Deliberately excludes ambiguous single words: bare "no" is usually just
+# answering a question, and bare "cancel" usually refers to an appointment
+# rather than to messaging -- suppressing a merchant for 30 days on either
+# would be far worse than missing it.
+_BARE_OPT_OUT_KEYWORDS = {
+    "stop", "stopall", "stop all",
+    "unsubscribe", "unsub",
+    "optout", "opt out", "opt-out",
+    "quit", "end", "revoke",
+    "band", "bas",
+}
+
+_PUNCT_STRIP_RE = re.compile(r"[^\w\s]+")
+
+
+def _is_bare_opt_out(message: str) -> bool:
+    """True when the whole message is a standalone opt-out keyword."""
+    if not isinstance(message, str):
+        return False
+    normalized = _PUNCT_STRIP_RE.sub(" ", message).strip().lower()
+    normalized = " ".join(normalized.split())
+    return normalized in _BARE_OPT_OUT_KEYWORDS
+
 _INTENT_TRANSITION_PATTERNS = [
     r"\bgo ahead\b",
     r"\blet'?s do it\b",
@@ -179,7 +216,7 @@ class ConversationManager:
             self._save(state)
             return {"action": "end", "intent": "turn_cap"}
 
-        if _matches_any(_OPT_OUT_PATTERNS, message):
+        if _matches_any(_OPT_OUT_PATTERNS, message) or _is_bare_opt_out(message):
             state.ended = True
             self._save(state)
             if state.merchant_id:
