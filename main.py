@@ -46,7 +46,7 @@ _LLM_GROUNDED_REPLY_INTENTS = {"intent_transition", "off_topic", "engaged"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("vera_bot.main")
 
-APP_VERSION = "2.1.4"
+APP_VERSION = "2.2.0"
 TEAM_NAME = "Airo"
 TEAM_MEMBERS = ["Kapil Meena"]
 MODEL_NAME = "amazon.nova-pro-v1:0 via Amazon Bedrock, with a deterministic grounded-template fallback library"

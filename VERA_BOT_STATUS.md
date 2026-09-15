@@ -1,8 +1,39 @@
 # Vera — Status Report
 
-**Team**: Airo (Kapil Meena) · **Version**: 2.1.4 · **Endpoint**: `https://100-56-247-98.sslip.io`
+**Team**: Airo (Kapil Meena) · **Version**: 2.2.0 · **Endpoint**: `https://100-56-247-98.sslip.io`
 **Model**: `amazon.nova-pro-v1:0` via Amazon Bedrock, with a deterministic grounded-template fallback
-**Report date**: 2026-09-10
+**Report date**: 2026-09-15
+
+---
+
+## 0. Official evaluation result — read this before the numbers below
+
+magicpin's own automated evaluation reports:
+
+| Attempt | Reported score |
+|---|---|
+| First submission | **58** |
+| Resubmission (10 September) | **50** |
+| **Qualifying threshold** | **70** |
+
+The score is a hard gate on the interview process, and the current build does not clear it.
+
+Everything in the sections that follow is measured by **our own independent judge** and reports
+42.00/50 (84%) across the 30 canonical pairs, and 45.67/50 (91%) across the six pairs magicpin
+actually scores. **That is a large unexplained gap against their 50, and their rubric is the
+authoritative one.** The gap is too wide to be rubric noise, which means their score includes
+something this report does not capture. Current leading explanations, neither confirmed:
+
+1. **Conversation handling.** Every observed run returns a silent `wait` on two of seven
+   conversations and terminates on the hostile scenario, where the brief asks the bot to stay
+   on-mission politely. This path has never been optimised.
+2. **A degraded run.** The harness ran twice on 14 September; the second run returned only 3 of 6
+   messages because the first run's opt-out scenario had applied a 30-day merchant-level suppression
+   to a merchant owning three of the scored triggers (see §7.6). If a missing action scores zero, that
+   alone roughly halves the reported figure.
+
+Treat the sections below as a record of the engineering work and of quality as measured locally —
+not as a prediction of the official score.
 
 ---
 
@@ -226,3 +257,67 @@ Stated plainly rather than omitted.
    attaches trigger kinds to categories where they make no sense (`chronic_refill_due` to a
    dentist, `appointment_tomorrow` to a merchant with no booking data). These are detected
    and reframed; a coherent assignment would be better than any mitigation.
+
+---
+
+## 7.6 Suppression state leaks between evaluation runs (highest-severity open issue)
+
+Discovered 15 September by reading service logs. This is the most consequential open defect and is
+**not yet fixed**.
+
+The evaluation harness runs a `STOP` scenario and a hostile-message scenario during its reply phase.
+Both are correctly classified as a hard opt-out, and per §5 of the testing brief a hard opt-out applies
+a **30-day merchant-level suppression**. Both scenarios target `m_001_drmeera_dentist_delhi`, which
+owns **three of the six triggers the harness scores**.
+
+The result is that each run poisons the next:
+
+```
+run N     6 triggers pushed  →  6 messages composed
+          reply phase → STOP + hostile → opt_out → suppress:merchant:m_001 (30-day TTL)
+run N+1   6 triggers pushed  →  3 messages     (m_001's three triggers skipped)
+```
+
+`main.py` performs `if suppression.is_merchant_suppressed(mid): continue`, so those triggers produce no
+action at all.
+
+**This occurred in production.** Two runs on 14 September, thirteen minutes apart:
+
+| Run | Time (UTC) | Triggers pushed | Actions returned |
+|---|---|---|---|
+| 2207 | 07:31:33 – 07:32:14 | 6 | **6** |
+| 2226 | 07:45:25 – 07:45:58 | 6 | **3** |
+
+The three lost messages were the highest-scoring in the set locally (49, 48 and 47 of 50). If the
+harness scores a missing action as zero, a degraded run understates quality by roughly half.
+
+The bot is behaving to specification here — the brief mandates the 30-day suppression. The defect is
+that suppression state survives across independent evaluation runs. A durable fix should keep the
+required behaviour for genuine merchants while preventing a test scenario from disabling the next run,
+for example by applying merchant-level suppression only when the opt-out arrives on a conversation this
+bot opened via a tick and can trace, and expiring it far sooner otherwise.
+
+As an interim measure Redis state was cleared on 15 September, so a single run is currently accurate.
+Any second run within 30 days will be degraded again.
+
+---
+
+## 8. Open work
+
+Ranked by expected impact on the official score. None are implemented.
+
+| # | Item | Rationale |
+|---|---|---|
+| 1 | Conversation handling — no silent `wait`, stay on-mission on hostile | 3 of 7 conversations, identical in every run; never optimised |
+| 2 | Durable fix for §7.6 | Prevents a halved score on any second run |
+| 3 | Require resolved figures to survive into the message | `38%` and `2,100-patient` were dropped in 4 of 4 controlled runs, on the brief's own Appendix A showcase example |
+| 4 | Reject wholly invented offers | One roll in five produced a `'Diwali Glow' package with 20% off`, grounded nowhere |
+| 5 | Obtain the official per-dimension breakdown | Without their scale and weighting, the above is partly guesswork |
+
+### A note on run-to-run variance
+
+Bedrock Nova exposes no seed parameter and rejects `temperature=0` exactly, so determinism is provided
+by a cache rather than by the model. The cache key includes the trigger id, and the harness mints fresh
+trigger ids per run — therefore pre-warming the cache **cannot** match a future graded run. Composing
+the same six pairs four times produced two to four distinct wordings per pair. Some of the movement
+between the reported 58 and 50 is attributable to this rather than to any code change.
