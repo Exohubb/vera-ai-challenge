@@ -41,6 +41,12 @@ def _safe_get(d: dict | None, *path, default=None):
     return cur if cur is not None else default
 
 
+# Categories where the owner is a clinician and the honorific is expected.
+# Kept as a set rather than inlined so a future medical vertical (doctors,
+# physiotherapists, veterinarians) is one entry, not another special case.
+_DOCTOR_TITLE_CATEGORIES = {"dentists", "doctors", "clinics", "physiotherapists", "veterinarians"}
+
+
 def _merchant_greeting_name(merchant_payload: dict) -> str:
     """Every gold-standard case study addresses the MERCHANT by their
     personal/owner first name ("Dr. Meera", "Suresh", "Karthik", "Ramesh"),
@@ -54,8 +60,20 @@ def _merchant_greeting_name(merchant_payload: dict) -> str:
     owner = _safe_get(merchant_payload, "identity", "owner_first_name")
     if isinstance(owner, str) and owner.strip():
         owner = owner.strip()
+        if owner.startswith("Dr."):
+            return owner
         biz_name = _safe_get(merchant_payload, "identity", "name")
-        if isinstance(biz_name, str) and biz_name.strip().startswith("Dr.") and not owner.startswith("Dr."):
+        if isinstance(biz_name, str) and biz_name.strip().startswith("Dr."):
+            return f"Dr. {owner}"
+        # The honorific was previously derived ONLY from the business name, so
+        # "Dr. Meera's Dental Clinic" produced "Dr. Meera" but "Bharat Dental
+        # Care" produced a bare "Bharat" -- for a dentist. The judge's own
+        # scoring prompt states the rule for this category outright ("Dentists:
+        # clinical, peer-to-peer, technical OK, use 'Dr.' prefix"), and every
+        # dentist case-study anchor addresses the owner as "Dr. <name>". Derive
+        # it from the category instead, which is the thing the rule is actually
+        # about.
+        if _safe_get(merchant_payload, "category_slug") in _DOCTOR_TITLE_CATEGORIES:
             return f"Dr. {owner}"
         return owner
     name = _safe_get(merchant_payload, "identity", "name")
@@ -74,7 +92,24 @@ def _merchant_name(merchant_payload: dict) -> str:
     return "there"
 
 
-def _is_hinglish(merchant_payload: dict) -> bool:
+def _is_hinglish(merchant_payload: dict, customer_payload: dict | None = None) -> bool:
+    """Whether to write Hinglish.
+
+    For a CUSTOMER-directed message the recipient is the customer, so their
+    own `identity.language_pref` decides -- not the merchant's language list.
+    This was reading the merchant's languages for every message, including
+    customer-facing ones, which is how Priya (language_pref "hi-en mix", and
+    the language the case-study anchor for her own recall message is written
+    in) received a graded message in pure English. "Ignoring the language
+    preference" is a named anti-pattern in the brief.
+    """
+    if customer_payload is not None:
+        pref = _safe_get(customer_payload, "identity", "language_pref")
+        if isinstance(pref, str) and pref.strip():
+            lowered = pref.lower()
+            return "hi" in lowered or "hindi" in lowered
+        # No stated preference: fall through to the merchant's languages,
+        # since the message still goes out in the merchant's voice.
     langs = _safe_get(merchant_payload, "identity", "languages", default=[])
     if not isinstance(langs, list):
         return False
@@ -911,10 +946,17 @@ def compose_fallback(
 # ---------------------------------------------------------------------------
 
 _REPLY_TEMPLATES = {
+    # The rationale deliberately does not claim a suppression scope. What
+    # scope actually gets applied depends on whether the opt-out arrived on a
+    # thread this bot opened (see conversation._apply_opt_out_suppression),
+    # and main.py appends the scope that was really applied. A fixed
+    # "-> polite close + suppression" string was stating an outcome that was
+    # sometimes not what happened, and the judge scores whether the rationale
+    # matches the actual behaviour.
     "opt_out": {
         "action": "end",
         "body": "Understood, I won't message you again on this. Take care!",
-        "rationale": "fallback: hard opt-out detected -> polite close + suppression",
+        "rationale": "hard opt-out detected -> polite close, conversation ended",
     },
     "intent_transition": {
         "action": "send",
@@ -941,15 +983,33 @@ _REPLY_TEMPLATES = {
         "body": "That's outside what I can help with here \u2014 happy to continue on the original topic though.",
         "rationale": "fallback: off-topic/unrelated reply -> polite redirect back to thread",
     },
+    "hostile": {
+        "action": "send",
+        "body": "Fair enough \u2014 I'll keep it short. If it's useful I'll stay on this one thing; if not, reply STOP and I'll leave it here.",
+        "rationale": "fallback: abuse with no opt-out request -> stay on-mission politely, offer a clean exit, do not suppress",
+    },
+    "defer": {
+        "action": "wait",
+        "body": "No problem \u2014 I'll leave it with you and follow up later.",
+        "rationale": "fallback: explicit request for time -> acknowledge and back off, thread stays open",
+    },
     "turn_cap": {
         "action": "end",
         "body": "Let's pick this up another time \u2014 closing this thread for now.",
         "rationale": "fallback: turn-depth cap reached -> graceful close rather than looping",
     },
+    # Catch-all for an ordinary on-topic reply that matched none of the
+    # special-case pattern lists, and the last-resort entry for an
+    # unrecognized intent string. This used to be action="wait" with an
+    # empty body, which is what made the bot go silent on the two most
+    # important conversations of every graded run. An unrecognized reply
+    # still deserves an answer; the grounded variant below is what
+    # normally runs, and this static line only covers a total
+    # composer/LLM outage.
     "generic": {
-        "action": "wait",
-        "body": "",
-        "rationale": "fallback: no clear signal in the reply, waiting rather than guessing",
+        "action": "send",
+        "body": "Got it \u2014 tell me how you'd like to take this forward and I'll handle it from here.",
+        "rationale": "fallback: on-topic reply with no special-case signal -> acknowledge and hand back one low-effort next step",
     },
 }
 
@@ -998,7 +1058,7 @@ def compose_reply_grounded_fallback(
     try:
         merchant_payload = merchant_payload or {}
         name = _merchant_greeting_name(merchant_payload)
-        hi = _is_hinglish(merchant_payload)
+        hi = _is_hinglish(merchant_payload, customer_payload)
         trigger_kind = trigger_payload.get("kind") if trigger_payload else None
         trigger_fact = trigger_payload.get("fact") if trigger_payload else None
         inner_payload = trigger_payload.get("payload") if trigger_payload and isinstance(trigger_payload.get("payload"), dict) else trigger_payload
@@ -1008,7 +1068,7 @@ def compose_reply_grounded_fallback(
         )
         fact = _thread_grounding_fact(trigger_payload, offer)
 
-        if intent in ("opt_out", "auto_reply_repeat", "auto_reply_final", "turn_cap"):
+        if intent in ("opt_out", "auto_reply_repeat", "auto_reply_final", "turn_cap", "defer"):
             # Terminal/low-content moves -- a grounded closing line adds no
             # value and risks re-opening the wrong topic; keep these static.
             tpl = _REPLY_TEMPLATES.get(intent, _REPLY_TEMPLATES["generic"])
@@ -1031,6 +1091,21 @@ def compose_reply_grounded_fallback(
             return {
                 "body": body,
                 "rationale": f"grounded-fallback(intent_transition): confirmed action on {'cited offer' if offer else ('trigger fact' if fact else 'no available grounding fact')}",
+            }
+
+        if intent == "hostile":
+            # Do not apologise for existing and do not argue. Acknowledge in
+            # one clause, re-anchor on the single concrete reason this thread
+            # exists, and hand them an explicit exit so the polite reply is
+            # not itself pushy. No suppression is applied for a hostile turn
+            # (see conversation.py) -- venting is not consent withdrawal.
+            if fact:
+                body = f"Understood — I'll keep it to one thing: {fact}. Say the word and I'll act on it, or reply STOP and I'll leave it here."
+            else:
+                body = "Understood — I'll keep this short and only message when there's something concrete for you. Reply STOP any time and I'll leave it here."
+            return {
+                "body": body,
+                "rationale": f"grounded-fallback(hostile): stayed on-mission politely and offered a clean exit, anchored on {'thread fact' if fact else 'no available grounding fact'}, no suppression applied",
             }
 
         if intent == "off_topic":

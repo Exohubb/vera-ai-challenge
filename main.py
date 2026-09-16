@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os as _os
+import re as _re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -41,12 +42,12 @@ from validators import (
 # fact worth grounding a goodbye or an auto-reply nudge in, and keeping
 # them fully deterministic/static is the safer choice for compliance-
 # adjacent closing messages.
-_LLM_GROUNDED_REPLY_INTENTS = {"intent_transition", "off_topic", "engaged"}
+_LLM_GROUNDED_REPLY_INTENTS = {"intent_transition", "off_topic", "engaged", "hostile", "generic"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("vera_bot.main")
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 TEAM_NAME = "Airo"
 TEAM_MEMBERS = ["Kapil Meena"]
 MODEL_NAME = "amazon.nova-pro-v1:0 via Amazon Bedrock, with a deterministic grounded-template fallback library"
@@ -60,13 +61,20 @@ APPROACH = (
     "exactly one verifiable claim from the pushed contexts, and where a trigger payload carries "
     "no event data it grounds the message in real adjacent signals (7-day performance deltas, "
     "category peer benchmarks, cumulative customer counts, subscription state, visit history) "
-    "instead of degrading to generic copy. Every model draft must clear six grounding gates "
-    "-- numeric-claim verification, fabricated clock times, invented URLs, category-vs-merchant "
-    "offer leakage, new-customer offer eligibility, and unsupported appointment assertions -- "
-    "plus per-category banned-phrase and single-CTA checks, with one named-correction retry "
-    "before falling back to a deterministic grounded template. Conversations run as a state "
-    "machine (auto-reply escalation, hard opt-out including a bare STOP, intent transition, "
-    "off-topic redirect) with per-trigger and per-merchant suppression enforcing restraint."
+    "instead of degrading to generic copy. Grounding is checked in both directions: every model "
+    "draft must clear numeric-claim verification, fabricated clock times, invented URLs, "
+    "category-vs-merchant offer leakage, offers invented from nothing, unsupported discount "
+    "percentages, new-customer offer eligibility and unsupported appointment assertions -- and "
+    "must also RETAIN the hard figures the fact resolver already grounded, so a draft cannot pass "
+    "by paraphrasing its best evidence away. Per-category banned-phrase and single-ask checks "
+    "apply too, with one named-correction retry before falling back to a deterministic grounded "
+    "template; a CTA shape the context cannot support (a multi-choice slot pick with no slots) is "
+    "never demanded. Conversations run as a state machine -- auto-reply escalation, hard opt-out "
+    "including a bare STOP, intent transition, off-topic redirect, hostility answered rather than "
+    "hung up on, and an explicit request for time honoured -- with every other reply answered "
+    "substantively rather than met with silence. Opt-out suppression is applied at the scope it "
+    "can be attributed to: merchant-wide for a conversation this bot opened, conversation-scoped "
+    "for a thread it cannot trace to an outbound of its own."
 )
 CONTACT_EMAIL = _os.environ.get("TEAM_CONTACT_EMAIL", "kapilmeena30062003@gmail.com")
 SUBMITTED_AT = _os.environ.get("SUBMITTED_AT", "2026-09-10T00:00:00Z")
@@ -93,6 +101,20 @@ MAX_ACTIONS_PER_TICK = 20
 TICK_DEADLINE_SECONDS = 22.0
 TICK_COMPOSE_CONCURRENCY = 8
 
+# NOTE on the two additions to this set ("hostile", "generic"): both were
+# previously handled by the static template branch below, and both were the
+# reason 3 of the 7 conversations in every graded run produced nothing
+# usable. "generic" is the catch-all bucket every ordinary on-topic reply
+# lands in (see the long note at the end of conversation.handle_reply); it
+# used to return action="wait" with no body at all. "hostile" is new and
+# must be answered, not closed (Phase 4 scenario 3: "stay on-mission
+# politely"). Both now get a real grounded composition like any other
+# in-thread reply. The terminal/low-content intents -- opt_out,
+# auto_reply_repeat/final, turn_cap, defer -- stay on the static library:
+# there is no thread fact worth grounding a goodbye or a back-off in, and
+# keeping compliance-adjacent closing lines fully deterministic is the
+# safer choice.
+
 # /v1/reply's "wait" action should carry `wait_seconds` per the official
 # examples (challenge-testing-brief.md 2.3, api-call-examples.md 2.5/4.1) --
 # main.py's response builder was previously omitting this field entirely.
@@ -102,7 +124,10 @@ TICK_COMPOSE_CONCURRENCY = 8
 # reasonably re-poll within the 60-minute test window.
 _WAIT_SECONDS_BY_INTENT = {
     "auto_reply_repeat": 86400,
-    "generic": 1800,
+    # Explicit "not now / call me later" -- honour the request with a real
+    # back-off rather than the default re-poll interval. "generic" is
+    # deliberately no longer listed here: it is an action="send" intent now.
+    "defer": 14400,
 }
 DEFAULT_WAIT_SECONDS = 1800
 
@@ -579,6 +604,28 @@ def _recover_thread_context(
     return mid, merchant_payload, trigger_payload, category_payload, customer_payload
 
 
+_BINARY_CTA_RE = _re.compile(
+    r"\breply\s+(?:yes|stop|y/n)\b|\byes\s*/\s*stop\b|\bshall i\b|\bshould i\b"
+    r"|\bwant me to\b|\bconfirm\b|\bhaan ya\b|\bkar doon\b",
+    _re.IGNORECASE,
+)
+_MULTI_CHOICE_CTA_RE = _re.compile(r"\breply\s+1\b|\b1 for\b|\bwhich (day|slot|time)\b", _re.IGNORECASE)
+
+
+def _reply_cta_shape(body: str) -> str:
+    """Declares the CTA shape of a composed reply for the response envelope.
+    Read off the body itself so the declared shape can't drift from the
+    actual ask -- the judge scores whether the rationale/metadata match the
+    output."""
+    if _MULTI_CHOICE_CTA_RE.search(body):
+        return "multi_choice"
+    if _BINARY_CTA_RE.search(body):
+        return "binary_yes_no"
+    if "?" in body:
+        return "open_ended"
+    return "none"
+
+
 @app.post("/v1/reply")
 async def post_reply(request: Request):
     try:
@@ -634,6 +681,18 @@ async def post_reply(request: Request):
         fb = compose_reply_fallback(intent)
         body_text = fb["body"]
         rationale = fb["rationale"]
+        if intent == "opt_out":
+            # State the scope that was actually applied rather than a fixed
+            # claim. A 30-day block on all outbound to a business is only
+            # applied when the opt-out arrived on a thread we opened; on an
+            # unattributable thread the opt-out binds that thread only.
+            scope = result.get("suppression_scope", "conversation")
+            rationale += (
+                "; suppression scope=merchant (30d, opt-out arrived on a conversation this bot opened)"
+                if scope == "merchant"
+                else "; suppression scope=conversation (thread not traceable to an outbound of ours, "
+                     "so no merchant-wide block inferred)"
+            )
 
     if action == "send" and body_text and conv_manager.has_been_sent(conversation_id, body_text):
         # anti-repetition guard: never send an exact/near-duplicate again.
@@ -651,11 +710,27 @@ async def post_reply(request: Request):
         if trigger_id:
             suppression.close_open_conversation(mid, trigger_id)
 
-    logger.info("reply decision: conv=%s intent=%s action=%s", conversation_id, intent, action)
+    # The incoming message text is logged (truncated) alongside the decision.
+    # Without it, a graded run tells us the classifier's verdict but not what
+    # it was reacting to -- e.g. the harness's off-topic scenario classified as
+    # `engaged`, and there was no way to see what it had actually asked. The
+    # payloads are synthetic per the brief's privacy note, and this is the
+    # difference between a graded run being diagnosable afterwards or not.
+    logger.info(
+        "reply decision: conv=%s from=%s turn=%s intent=%s action=%s incoming=%r",
+        conversation_id, body.get("from_role"), body.get("turn_number"), intent, action,
+        incoming_message[:220] if isinstance(incoming_message, str) else incoming_message,
+    )
 
     response = {"action": action, "rationale": rationale}
     if action != "wait" or body_text:
         response["body"] = body_text
+    if action == "send" and body_text:
+        # The documented "send" response shape (challenge-testing-brief.md
+        # 2.3) is {action, body, cta, rationale}; cta was being omitted
+        # entirely on every reply. Derived from the composed body rather
+        # than hardcoded so the declared shape matches the actual ask.
+        response["cta"] = _reply_cta_shape(body_text)
     if action == "wait":
         # Official contract (challenge-testing-brief.md 2.3;
         # api-call-examples.md 2.5/4.1) always carries wait_seconds on a

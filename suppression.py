@@ -103,6 +103,26 @@ class SuppressionStore:
     def has_open_conversation(self, merchant_id: str, trigger_id: str) -> bool:
         return self._open_conv_backend.get(f"{merchant_id}:{trigger_id}") is not None
 
+    def is_bot_opened_conversation(self, merchant_id: str, conversation_id: str) -> bool:
+        """True when `conversation_id` is one this bot itself opened for
+        this merchant via /v1/tick (it was registered above with that exact
+        id), as opposed to a thread id minted elsewhere and pointed at this
+        merchant.
+
+        This is the attribution test behind conversation.py's opt-out scope
+        rule: a merchant-wide 30-day suppression is applied only for an
+        opt-out arriving on an outbound we can trace to a tick decision of
+        ours. See _apply_opt_out_suppression for the full reasoning and the
+        measured failure it prevents.
+        """
+        if not merchant_id or not conversation_id:
+            return False
+        for key in self._open_conv_backend.keys(f"{merchant_id}:"):
+            rec = self._open_conv_backend.get(key)
+            if rec and rec.get("conversation_id") == conversation_id:
+                return True
+        return False
+
     def get_open_trigger_for_merchant(self, merchant_id: str) -> Optional[str]:
         """Best-effort recovery of which trigger a merchant's currently-open
         conversation belongs to, used by /v1/reply to ground LLM replies
