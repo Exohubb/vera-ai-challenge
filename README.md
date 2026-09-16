@@ -10,10 +10,10 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Bedrock](https://img.shields.io/badge/Amazon%20Bedrock-Nova%20Pro-FF9900?logo=amazonaws&logoColor=white)](https://aws.amazon.com/bedrock/)
 [![Redis](https://img.shields.io/badge/Redis-state%20store-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![Tests](https://img.shields.io/badge/tests-124%20passing-brightgreen)](#-testing)
-[![Score](https://img.shields.io/badge/independent%20judge-84%25%20EXCELLENT-brightgreen)](#-score-breakdown)
+[![Tests](https://img.shields.io/badge/tests-166%20passing-brightgreen)](#-testing)
+[![Score](https://img.shields.io/badge/independent%20judge-86%25%20EXCELLENT-brightgreen)](#-score-breakdown)
 [![Penalties](https://img.shields.io/badge/fabrication%20penalties-0-brightgreen)](#-score-breakdown)
-[![Version](https://img.shields.io/badge/version-2.1.4-blue)](#)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#)
 
 </div>
@@ -389,12 +389,12 @@ Scored against the **full official canonical set — all 30 (merchant, trigger) 
 
 | Dimension | Avg Score | Bar |
 |---|---:|---|
-| Merchant Fit | **8.93** / 10 | █████████░ |
-| Trigger Relevance | **8.50** / 10 | ████████▌░ |
-| Specificity | **8.30** / 10 | ████████░░ |
+| Merchant Fit | **9.08** / 10 | █████████░ |
+| Specificity | **8.97** / 10 | █████████░ |
+| Trigger Relevance | **8.75** / 10 | ████████▊░ |
 | Category Fit | **8.20** / 10 | ████████░░ |
-| Engagement Compulsion | **8.07** / 10 | ████████░░ |
-| **Total** | **42.00 / 50** | **84% — EXCELLENT** |
+| Engagement Compulsion | **7.98** / 10 | ████████░░ |
+| **Total** | **42.98 / 50** | **86% — EXCELLENT** |
 
 </td><td>
 
@@ -402,48 +402,64 @@ Scored against the **full official canonical set — all 30 (merchant, trigger) 
 %%{init: {"theme": "dark"}}%%
 pie showData
     title Score composition (of 50)
-    "Merchant Fit (8.93)" : 8.93
-    "Trigger Relevance (8.50)" : 8.50
-    "Specificity (8.30)" : 8.30
+    "Merchant Fit (9.08)" : 9.08
+    "Specificity (8.97)" : 8.97
+    "Trigger Relevance (8.75)" : 8.75
     "Category Fit (8.20)" : 8.20
-    "Engagement (8.07)" : 8.07
-    "Headroom" : 8.00
+    "Engagement (7.98)" : 7.98
+    "Headroom" : 7.02
 ```
 
 </td></tr>
 </table>
 
-**Distribution across all 30 scored messages:**
+The 30 pairs were scored **twice**, by two independent judge passes over byte-identical message
+bodies, so the run-to-run spread of the measurement itself is visible rather than assumed:
+
+| Run | Mean |
+|---|---:|
+| Run A | 42.83 / 50 |
+| Run B | 43.13 / 50 |
+| **Reported (mean of both)** | **42.98 / 50** |
+
+Mean absolute per-pair disagreement between the two passes on identical text: **1.17 points**; the
+headline moved **0.30**. Re-composing and re-scoring the same 30 pairs moved individual pairs by
+~5.7 points on average — so almost all of the run-to-run volatility below is Nova's own wording
+variance on a cold cache, not the judge.
+
+**Distribution across the 60 pooled scores:**
 
 | Metric | Value |
 |---|---|
 | Minimum | 26 / 50 |
-| Maximum | **50 / 50** (perfect) |
-| Median | 44 / 50 |
-| Mean | 42.00 / 50 |
-| Messages below 30 | 3 |
-| Messages ≥ 40 | 23 |
-| Messages ≥ 45 (near-perfect) | 13 |
+| Maximum | 49 / 50 |
+| Median | 43.5 / 50 |
+| Mean | 42.98 / 50 |
+| Scores below 30 | 2 of 60 |
+| Scores ≥ 40 | 49 of 60 |
+| Scores ≥ 45 | 27 of 60 |
 | **Fabrication / jargon penalties** | **0** |
 
 ```
-Score histogram (30 messages)
+Score histogram (60 pooled scores)
 26 █ (1)
-27 █ (1)
 28 █ (1)
-33 █ (1)
-34 █ (1)
+31 █ (1)
+35 █ (1)
+36 █ (1)
 37 █ (1)
 38 █ (1)
-40 █ (1)
-41 ██ (2)
-43 ███ (3)
-44 ████ (4)
-45 ███ (3)
-46 ██ (2)
-47 ███ (3)
-48 ████ (4)
-50 █ (1)
+39 ████ (4)
+40 █████ (5)
+41 ████ (4)
+42 █ (1)
+43 █████████ (9)
+44 ███ (3)
+45 █████ (5)
+46 █████ (5)
+47 █████ (5)
+48 ███████████ (11)
+49 █ (1)
 ```
 
 ### Iteration history
@@ -456,15 +472,24 @@ Every row is a full 30-pair run against the live service, same judge, same rubri
 | iteration 1 | 36.90 / 73.8% | 7.17 | 7.57 | 7.27 | 8.00 | 7.13 | 7 |
 | iteration 2 | 39.53 / 79.1% | 7.63 | 7.83 | 8.43 | 8.27 | 7.57 | 6 |
 | iteration 3 | 41.00 / 82.0% | 8.20 | 7.93 | 8.63 | 8.53 | 7.77 | 2 |
-| **2.1.4** | **42.00 / 84.0%** | **8.30** | **8.20** | **8.93** | **8.50** | **8.07** | **0** |
+| 2.1.4 | 42.00 / 84.0% | 8.30 | 8.20 | 8.93 | 8.50 | 8.07 | 0 |
+| **2.3.0** | **42.98 / 86.0%** | **8.97** | **8.20** | **9.08** | **8.75** | **7.98** | **0** |
 
-Net **+9.03 points (+27% relative)**, every dimension improved, penalties driven from 3 to **0**.
+Net **+10.01 points (+30% relative)**, penalties held at **0**.
+
+The 2.3.0 row is where the two-directional grounding check (§ below) landed, and the dimension it
+moved is the one it was aimed at: **Specificity +0.67** vs 2.1.4, the largest single-dimension gain
+since the first iteration. Engagement dipped 0.09 — inside the measurement's own spread, and a
+deliberate tradeoff, since the figures the gate now forces into the message occupy words that
+previously went to persuasion.
 
 > [!NOTE]
 > The penalty column is the figure worth reading. It *rose* to 7 during iteration 1 — pushing for specificity increases fabrication risk — and only closed to 0 once the grounding gates caught up. Specificity and zero-fabrication are in direct tension on this dataset, and the current build sits where they balance.
 
 > [!WARNING]
-> **Honest caveats.** Nova is not perfectly deterministic on a cold cache, so individual pairs swung widely between runs (one moved 22 → 43 → 20 → 43). The aggregate trend across five runs is the trustworthy signal; a single pair's number is not — treat 42.00 as roughly **±1.5–2**. Only one judge model was used; the official judge is a different, unknown model. Earlier self-scoring in this repo used Nova to grade Nova's own output and was discarded as favourably biased.
+> **Honest caveats.** Nova is not perfectly deterministic on a cold cache, so individual pairs swing widely between runs — one moved 10 → 43 across two runs of the same build, another 46 → 22. The double-scoring above localises the cause: with the message text held fixed the judge only disagrees with itself by ~1.2 points per pair, so the volatility is composition, not scoring. Treat any single-run figure as roughly **±1.5–2** and a single pair's number as not meaningful on its own. Only one judge model was used; the official judge is a different, unknown model. Earlier self-scoring in this repo used Nova to grade Nova's own output and was discarded as favourably biased.
+>
+> **This metric does not cover the reply path.** It scores outbound composition only. The changes in 2.3.0 with the largest expected effect on the official score — no silent conversation turns, and the suppression-scope fix — are invisible to it, and are verified behaviourally instead (see the scenario table below).
 
 ### Operational verification
 
@@ -563,19 +588,39 @@ Two rigorous passes surfaced concrete gaps. Bugs 1–13 came from testing agains
 > [!NOTE]
 > **One "bug" turned out to be in the measurement, not the product.** An early version of `gemini_judge.py` omitted `customer_aggregate` from the merchant context shown to the scorer and never stated who a message was addressed to — producing two false fabrication penalties. Passing the full payload and declaring the addressee moved those pairs **13 → 43** and **34 → 44** with zero code change. Recorded because it is a live risk: if the official judge shows its scorer less context than the bot received, correctly grounded citations can still read as fabricated.
 
+Bugs 25–34 came from a fourth pass: reading the **live Redis state and service logs of a real graded
+run** on the deployed endpoint, rather than the dataset or the local judge.
+
+| # | Severity | Bug | Fix |
+|---|:---:|---|---|
+| 25 | 🔴 High | **An opt-out on any thread suppressed the merchant for 30 days**, regardless of whether the bot had ever opened that thread. The harness's own `STOP` and hostile scenarios target a merchant that owns 3 of the 6 graded triggers, so run *N* armed a 30-day block and run *N+1* returned **3 actions instead of 6** — confirmed live, 13 minutes apart, on the real endpoint | Suppression scope now depends on attribution: merchant-wide only for a `conversation_id` this bot registered from its own tick; conversation-scoped otherwise |
+| 26 | 🔴 High | **Every ordinary reply was met with silence.** The no-clear-signal bucket returned `action=wait` with an empty body, and that is where all normal merchant/customer replies land — confirmed in the actual Redis conversation state of a real run | That bucket now composes a grounded reply that acknowledges and advances |
+| 27 | 🟠 Medium | **Hostility was treated as consent withdrawal** — abuse with no request to stop ended the conversation and suppressed the merchant | New `hostile` intent: on-mission reply, explicit exit offered, thread stays open, no suppression |
+| 28 | 🟠 Medium | The brief's own Phase 4 off-topic example — *"can you also help me file my GST?"* — classified as `engaged` | GST/ITR/tax/accounting/FSSAI/visa family added to the off-topic denylist |
+| 29 | 🔴 High | **Grounded numbers were resolved and then thrown away.** The dentist research-digest message — the brief's own gold-standard tuple — shipped live with no `38%`, no `2,100`, no citation at all | `_digest_effect_clause()` carries the quantified effect into the fact; `find_dropped_grounded_figures()` requires every percentage/count ≥ 100 in the fact to survive into the body |
+| 30 | 🔴 High | **Free category-catalog offers leaked into live output as the merchant's own.** `find_category_offer_leakage` skipped every offer with `price is None`, and every free offer (`value: "0"`) computes to `price=None` — so "Free Consultation", "Free Delivery > ₹500" etc. were 100% exempt. A live reply told a dentist whose only offer is Dental Cleaning @ ₹299 to *"Book now for a free consultation!"* | Matched on the citable phrase instead, and only when the sentence asserts ownership (`your`, `available`, `book now`) — proposing to create one stays allowed |
+| 31 | 🟠 Medium | **Two asks counted as one.** The imperative-CTA check only ran when there were no question marks, so a real graded message — *"Which works for you? Also, don't forget our Dental Cleaning offer at ₹299."* — passed cleanly, burying the CTA | `count_ctas()` counts per sentence; a new `find_content_after_cta()` gate independently catches content appended after the ask |
+| 32 | 🔴 High | **A CTA shape the context couldn't support was mandated.** `recall_due`'s table CTA is `multi_choice`; on a placeholder payload with no slots, two sensible drafts were rejected for not being `multi_choice`, and the message fell to a template scoring 10/50 | `_has_choice_set()` degrades to `binary_yes_no`/`open_ended` when no concrete choices exist |
+| 33 | 🟡 Low | Dentist owners without "Dr." in the business name (e.g. Bharat Dental Care) were greeted with a bare first name — for a category the judge's own scoring rubric names the honorific rule for | Honorific derived from `category_slug`, not the business-name string, and passed into the LLM prompt too |
+| 34 | 🟠 Medium | **Language preference was a prompt instruction, and got ignored.** Priya's `language_pref` is `"hi-en mix"`; a real graded recall message to her shipped in pure English despite an explicit "match her language" rule in the prompt | `find_missing_hinglish()` — a mechanical gate keyed off actual Hindi-in-Latin-script vocabulary (aap/kya/hai/karo/chahiye/…), checked against the recipient's own preference (customer's, not the merchant's, on customer-facing sends) |
+
+> [!IMPORTANT]
+> **The pattern across 25–34: prompt-only rules got ignored on real rolls; mechanical gates held.** Every fix in this pass that was tried as a prompt instruction first and *then* converted to a gate (dropped figures, buried CTA, language match) was observed failing at least once as a prompt-only rule before the gate went in. Treat that as the operating principle for anything added later — state the rule, then check it in code.
+
 ---
 
 ## ✅ Testing
 
 ```
 $ pytest tests/ -q
-================= 124 passed, 150 warnings in 113.05s (0:01:53) =================
+================= 166 passed, 150 warnings in 122.25s (0:02:02) =================
 ```
 
 | Test file | Focus |
 |---|---|
 | `test_composer.py` | Fact-verification, no-hallucination, offer citation, unknown-kind safety |
-| `test_conversation.py` | Auto-reply escalation, opt-out (incl. bare `STOP`), intent-transition, anti-repetition, turn cap |
+| `test_conversation.py` | Auto-reply escalation, opt-out (incl. bare `STOP`) and its suppression **scope**, hostility vs consent withdrawal, no-silent-turn default, closed-thread replay, intent-transition, anti-repetition, turn cap |
+| `test_grounding_gates.py` | Dropped-figure retention, invented/free-offer leakage, unsupported discounts, ask-counting, buried CTA, language-preference gate |
 | `test_endpoints.py` | Contract tests for all 5 endpoints, idempotency, 4xx/413 handling, error-shape compliance |
 | `test_category_styles.py` | The real nested `voice` payload shape vs the flat fixture shape |
 | `test_live_bedrock.py` | Live Nova Pro calls against the challenge brief's own worked example |
@@ -649,6 +694,6 @@ python3 bot.py         # regenerate submission.jsonl for the 30 canonical pairs
 
 <div align="center">
 
-**Built for the magicpin Vera AI Challenge** · Team *Airo* · v2.1.4
+**Built for the magicpin Vera AI Challenge** · Team *Airo* · v2.3.0
 
 </div>

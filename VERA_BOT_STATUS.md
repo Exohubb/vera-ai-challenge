@@ -1,6 +1,6 @@
 # Vera — Status Report
 
-**Team**: Airo (Kapil Meena) · **Version**: 2.2.0 · **Endpoint**: `https://100-56-247-98.sslip.io`
+**Team**: Airo (Kapil Meena) · **Version**: 2.3.0 · **Endpoint**: `https://100-56-247-98.sslip.io`
 **Model**: `amazon.nova-pro-v1:0` via Amazon Bedrock, with a deterministic grounded-template fallback
 **Report date**: 2026-09-15
 
@@ -19,21 +19,43 @@ magicpin's own automated evaluation reports:
 The score is a hard gate on the interview process, and the current build does not clear it.
 
 Everything in the sections that follow is measured by **our own independent judge** and reports
-42.00/50 (84%) across the 30 canonical pairs, and 45.67/50 (91%) across the six pairs magicpin
-actually scores. **That is a large unexplained gap against their 50, and their rubric is the
-authoritative one.** The gap is too wide to be rubric noise, which means their score includes
-something this report does not capture. Current leading explanations, neither confirmed:
+42.98/50 (86%) across the 30 canonical pairs. **That is a large unexplained gap against their 50,
+and their rubric is the authoritative one.** The gap is too wide to be rubric noise, which means
+their score includes something the 30-pair metric does not capture. Both leading explanations were
+identified from the service logs and live Redis state of a real graded run, and have now been
+**fixed** (not yet deployed — see §0.1):
 
-1. **Conversation handling.** Every observed run returns a silent `wait` on two of seven
-   conversations and terminates on the hostile scenario, where the brief asks the bot to stay
-   on-mission politely. This path has never been optimised.
-2. **A degraded run.** The harness ran twice on 14 September; the second run returned only 3 of 6
-   messages because the first run's opt-out scenario had applied a 30-day merchant-level suppression
-   to a merchant owning three of the scored triggers (see §7.6). If a missing action scores zero, that
-   alone roughly halves the reported figure.
+1. **Conversation handling.** The graded run's own Redis conversation state showed a silent `wait`
+   with an empty body on the merchant and customer reply threads — the no-clear-signal bucket sent
+   nothing at all, and that is where every ordinary reply lands. The hostile scenario also
+   terminated the conversation and suppressed the merchant, where the brief asks the bot to stay
+   on-mission politely.
+2. **A degraded run.** A run on 14 September returned only 3 of 6 messages because a prior run's
+   opt-out scenario had applied a 30-day merchant-level suppression to a merchant owning three of
+   the scored triggers. Confirmed again on 15 September in live Redis: the same merchant was
+   suppressed with ~29 days remaining after another graded run.
+3. **Live fabrication, confirmed directly from Redis.** The composed message bodies cached from a
+   real graded run showed a category-catalog "Free Consultation" template offered to a merchant
+   whose only real offer is Dental Cleaning @ ₹299, a reply promising a free consultation as an
+   existing product, a graded recall message to a customer whose `language_pref` is `"hi-en mix"`
+   shipped in pure English, and a dentist without "Dr." in the business name greeted by first name
+   only. All four are now fixed and covered by regression tests naming the exact pair.
+
+Both conversation-handling items are verified behaviourally rather than by the 30-pair score, which
+measures outbound composition only and is blind to the reply path.
 
 Treat the sections below as a record of the engineering work and of quality as measured locally —
-not as a prediction of the official score.
+not as a prediction of the official score. Reaching 70 is **not** guaranteed: magicpin's scale and
+weighting are unknown, and single-run variance at n=6 is large.
+
+## 0.1 Deployment status — read this too
+
+**As of this report, none of the fixes below have been deployed.** `git log` shows the fixes exist
+as commits on `main`; the live endpoint's `/v1/metadata` reported `"version": "2.2.0"` immediately
+before this deploy. The suppression leak in item 2 above was **armed on the live endpoint** at the
+time this report was written (~29 days remaining on a merchant owning half the graded triggers) —
+so the very next graded run against the old code would repeat the exact 3-of-6 failure this report
+describes, unless the fix ships and Redis is cleared first.
 
 ---
 
@@ -43,9 +65,9 @@ not as a prediction of the official score.
 |---|---|
 | Service | Live, `systemd` + Gunicorn/Uvicorn (2 workers), Redis-backed state |
 | All 5 endpoints | Implemented and schema-conformant (`/v1/context`, `/v1/tick`, `/v1/reply`, `/v1/healthz`, `/v1/metadata`) |
-| Local test suite | **124 passing**, 0 failing |
+| Local test suite | **166 passing**, 0 failing |
 | Canonical 30 pairs | **30/30 compose**, two ticks, both HTTP 200, no crashes |
-| Independent judge score | **42.00/50 (84.0%)**, **0 penalties** across all 30 messages |
+| Independent judge score | **42.98/50 (86.0%)**, **0 penalties** — mean of two scoring passes over identical bodies |
 | `/v1/tick` latency, 20 actions cold cache | **12.81s** against a 30s budget (~17s headroom) |
 | `/v1/healthz` under tick load | 7/7 probes HTTP 200, all < 2s |
 | Phase 3 adaptation | Verified — adopts newly injected context, no stale leakage |
@@ -68,10 +90,13 @@ Every row is a full 30-pair run against the live service, same judge, same rubri
 | iteration 1 | 36.90 / 73.8% | 7.17 | 7.57 | 7.27 | 8.00 | 7.13 | 7 |
 | iteration 2 | 39.53 / 79.1% | 7.63 | 7.83 | 8.43 | 8.27 | 7.57 | 6 |
 | iteration 3 | 41.00 / 82.0% | 8.20 | 7.93 | 8.63 | 8.53 | 7.77 | 2 |
-| **2.1.4 (current)** | **42.00 / 84.0%** | **8.30** | **8.20** | **8.93** | **8.50** | **8.07** | **0** |
+| 2.1.4 | 42.00 / 84.0% | 8.30 | 8.20 | 8.93 | 8.50 | 8.07 | 0 |
+| **2.3.0 (current)** | **42.98 / 86.0%** | **8.97** | **8.20** | **9.08** | **8.75** | **7.98** | **0** |
 
-Net: **+9.03 points (+27% relative)**, every dimension improved, and penalties
-driven from 3 to **0**. One pair (T07) scored a perfect 50/50.
+Net: **+10.01 points (+30% relative)**, penalties held at **0**. The 2.3.0 figure is the mean of
+**two** scoring passes over byte-identical bodies (42.83 and 43.13) — doing it twice showed the
+judge disagrees with itself by only ~1.2 points/pair on fixed text, so most of the remaining
+run-to-run swing is Nova's own composition variance, not the scorer.
 
 The penalty column is the figure worth reading. It rose to 7 during iteration 1 —
 pushing for specificity increased fabrication risk — and only closed to 0 once the
@@ -239,9 +264,10 @@ Simulated the injection sequence from the testing brief §4:
 Stated plainly rather than omitted.
 
 1. **Run-to-run variance is significant.** Nova is not perfectly deterministic on a cold
-   cache, so individual pairs swung widely across runs (one moved 22 → 43 → 20 → 43). The
-   aggregate trend across five runs is the trustworthy signal; a single pair's number is
-   not. Treat 42.00 as roughly ±1.5–2.
+   cache, so individual pairs swing widely across runs (one moved 10 → 43 between two runs of the
+   same build). Scoring the same bodies twice isolates the cause: the judge disagrees with itself
+   by ~1.2 points/pair, so the volatility is composition, not scoring. Treat any single-run figure
+   as roughly ±1.5–2.
 2. **One judge model was used.** The official judge is a different, unknown model with a
    different prompt. The direction of these fixes should transfer; the absolute figure may
    not.
@@ -260,10 +286,12 @@ Stated plainly rather than omitted.
 
 ---
 
-## 7.6 Suppression state leaks between evaluation runs (highest-severity open issue)
+## 7.6 Suppression state leaked between evaluation runs — FIXED in 2.3.0
 
-Discovered 15 September by reading service logs. This is the most consequential open defect and is
-**not yet fixed**.
+Discovered 15 September by reading service logs, and confirmed a second time by inspecting live
+Redis state directly (a merchant suppressed with ~29 days remaining after a real graded run). This
+was the most consequential defect found in the whole project; it is fixed and covered by regression
+tests as of 2.3.0.
 
 The evaluation harness runs a `STOP` scenario and a hostile-message scenario during its reply phase.
 Both are correctly classified as a hard opt-out, and per §5 of the testing brief a hard opt-out applies
@@ -291,28 +319,46 @@ action at all.
 The three lost messages were the highest-scoring in the set locally (49, 48 and 47 of 50). If the
 harness scores a missing action as zero, a degraded run understates quality by roughly half.
 
-The bot is behaving to specification here — the brief mandates the 30-day suppression. The defect is
-that suppression state survives across independent evaluation runs. A durable fix should keep the
-required behaviour for genuine merchants while preventing a test scenario from disabling the next run,
-for example by applying merchant-level suppression only when the opt-out arrives on a conversation this
-bot opened via a tick and can trace, and expiring it far sooner otherwise.
+The bot was behaving to specification — the brief mandates the 30-day suppression. The defect was
+the **scope** it was applied at: any inbound carrying a `merchant_id` could arm a merchant-wide
+block, even on a thread the bot had never opened.
 
-As an interim measure Redis state was cleared on 15 September, so a single run is currently accurate.
-Any second run within 30 days will be degraded again.
+**Fix (2.3.0):** `conversation._apply_opt_out_suppression()` now applies suppression only at the
+scope the opt-out can be attributed to — merchant-wide (30 days) when the opt-out arrives on a
+`conversation_id` this bot itself registered from a `/v1/tick` decision, and conversation-scoped
+only (closed permanently, no merchant-wide inference) otherwise. In production every outbound is
+tick-originated, so a genuine merchant opt-out is unaffected; the harness's scenario threads
+(`conv_<runid>_stop`, `conv_<runid>_hostile`) match no tick action and take the narrower path. A
+shortened cooldown window was considered and rejected — the two real runs above were 13 minutes
+apart, so any meaningful window would still have been open, and shortening a compliance control to
+route around a test artifact was the wrong trade.
+
+Verified end to end: replaying both opt-out scenarios against a merchant, then ticking again, still
+returns the action. Redis state on the live endpoint was suppressing a merchant with ~29 days
+remaining as of this report — **flush Redis on deploy**, or the very next graded run repeats the
+3-of-6 failure this section describes on the old code path.
 
 ---
 
 ## 8. Open work
 
-Ranked by expected impact on the official score. None are implemented.
+The five items previously ranked here are implemented as of 2.3.0:
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Conversation handling — no silent `wait`, stay on-mission on hostile | ✅ Done |
+| 2 | Durable fix for §7.6 | ✅ Done |
+| 3 | Require resolved figures to survive into the message | ✅ Done — `38%` and `2100` now both reach the message |
+| 4 | Reject wholly invented / free-catalog offers | ✅ Done — confirmed against a live graded body that shipped a fabricated free offer |
+| 5 | Merchant/customer language preference honored mechanically | ✅ Done — a real graded pair had shipped in the wrong language despite a prompt rule |
+
+Remaining:
 
 | # | Item | Rationale |
 |---|---|---|
-| 1 | Conversation handling — no silent `wait`, stay on-mission on hostile | 3 of 7 conversations, identical in every run; never optimised |
-| 2 | Durable fix for §7.6 | Prevents a halved score on any second run |
-| 3 | Require resolved figures to survive into the message | `38%` and `2,100-patient` were dropped in 4 of 4 controlled runs, on the brief's own Appendix A showcase example |
-| 4 | Reject wholly invented offers | One roll in five produced a `'Diwali Glow' package with 20% off`, grounded nowhere |
-| 5 | Obtain the official per-dimension breakdown | Without their scale and weighting, the above is partly guesswork |
+| 6 | **Deploy 2.3.0 and confirm a clean run** | None of the above is live until this happens; the suppression leak (§7.6) is currently armed on the endpoint |
+| 7 | Obtain the official per-dimension breakdown (`developers@magicpin.in`, no reply yet) | Without their scale and weighting, prioritisation past this point is guesswork |
+| 8 | Re-rank fact selection toward fields visible to a scorer that only sees a subset of the merchant payload | Speculative — we don't have their scoring prompt, only our own local approximation |
 
 ### A note on run-to-run variance
 
