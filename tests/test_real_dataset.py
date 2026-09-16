@@ -346,7 +346,18 @@ def test_richer_trigger_facts_preserve_grounded_fields():
 
     ipl = _load_trigger("trg_010_ipl_match_delhi")
     ipl_fact = resolve_fact(ipl["kind"], ipl["payload"])
-    assert "19:30:00+05:30" in ipl_fact and "not a weeknight" in ipl_fact
+    # The start time must survive, but as a time a merchant would read. This
+    # assertion used to require the raw "19:30:00+05:30" verbatim, and the
+    # composed message duly said "starts 19:30:00+05:30" -- a UTC offset in a
+    # WhatsApp message, which the rubric docks as exposing internal plumbing.
+    assert "7:30pm" in ipl_fact
+    assert "19:30:00+05:30" not in ipl_fact
+    # The weeknight flag must carry its consequence, not just its value. With a
+    # bare "not a weeknight" the model repeatedly wrote the self-contradicting
+    # "it's not a weeknight, so push your Tue-Thu offer today", inverting the
+    # contrarian judgement this trigger exists to demonstrate.
+    assert "NOT a weeknight" in ipl_fact
+    assert "hold a weekday-only offer back" in ipl_fact
 
     review = _load_trigger("trg_011_review_theme_late_delivery")
     review_fact = resolve_fact(review["kind"], review["payload"])
@@ -355,6 +366,11 @@ def test_richer_trigger_facts_preserve_grounded_fields():
     cde = _load_trigger("trg_022_cde_webinar_dentists")
     cde_fact = resolve_fact(cde["kind"], cde["payload"], category_payload=_load_category("dentists"))
     assert "free for members" in cde_fact
+    # The event date is the "why now" for a CDE invite and was absent from the
+    # fact entirely, leaving it to chance whether a draft pulled it out of the
+    # raw digest payload. Two runs of the same build scored this pair 48/50 and
+    # 29/50, the low one specifically faulted for missing "concrete dates".
+    assert "on May 2" in cde_fact
 
 
 def test_appointment_tomorrow_and_customer_lapsed_soft_are_in_router():

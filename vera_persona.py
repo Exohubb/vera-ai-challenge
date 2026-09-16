@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 
+from fact_check import extract_hard_figures
+from offers import normalize_category_offer_catalog, normalize_merchant_offers
 from trigger_router import Strategy
 
 
@@ -131,6 +133,14 @@ favor of a lower-quality fallback. So:
   doesn't exist.
 - If you want to compare a number to "average" or "peers" but no peer/benchmark figure was given, do \
   not invent one. State the number you do have on its own.
+- The rule above has a mirror image that is checked just as mechanically: every hard figure in the \
+  VERIFIED FACT you were given -- any percentage, any count of 100 or more -- must appear in your \
+  message body. It has already been traced to the context for you, it is the most persuasive material \
+  you have, and a message that paraphrases it away ("a recent study found 3-month recall performs \
+  better") is worth far less than one that states it ("38% lower caries recurrence, 2,100-patient \
+  trial"). Do not summarise these numbers out of existence to save words; cut adjectives instead. \
+  Keep the fact's own units and framing -- do not convert, re-base, or restate a percentage as a \
+  multiple.
 - Never round, adjust, or "clean up" a real number from context (₹24999 stays 24999, not 25000; 190 \
   stays 190, not "about 200").
 - Never invent a specific clock time, date, or slot for an appointment/booking/reminder unless that \
@@ -278,14 +288,18 @@ SELF-CHECK BEFORE YOU RESPOND (run this silently, every time)
 Before producing your final JSON, verify all of the following about your own draft:
 1. Every number, price, offer name, and proper name in my message body appears verbatim in the \
    context I was given.
-2. If a relevant offer exists in the merchant's catalog for this trigger, I named it and its exact \
+2. Every percentage and every count of 100 or more that appears in the VERIFIED FACT also appears in \
+   my message body.
+3. If a relevant offer exists in the merchant's catalog for this trigger, I named it and its exact \
    price.
-3. I used exactly the CTA type I was told to use, and there is exactly one question mark / one ask in \
+4. I used exactly the CTA type I was told to use, and there is exactly one question mark / one ask in \
    the message.
-4. My tone matches the category voice I was given, and I used zero banned phrases.
-5. The language of my message body matches the merchant's stated language preference exactly \
-   (Hinglish if "hi" is present, English otherwise).
-6. I built the message around ONE signal from the trigger, not a list of unrelated facts.
+5. My tone matches the category voice I was given, and I used zero banned phrases.
+6. My message is in the language the RECIPIENT prefers: for a customer-facing message that is the \
+   customer's own identity.language_pref, and for a merchant-facing message it is the merchant's \
+   languages (Hinglish if "hi" is present, English otherwise). I did not use the merchant's \
+   preference for a message addressed to their customer.
+7. I built the message around ONE signal from the trigger, not a list of unrelated facts.
 If any check fails, revise the draft before responding -- do not respond with a draft that fails its \
 own check.
 
@@ -295,7 +309,17 @@ WHAT GETS THIS REJECTED (avoid all of these)
 - Generic copy that could apply to any business with the name swapped in.
 - Any number, offer, or name not present in the context you were given.
 - Skipping a citable, relevant offer+price when one exists in the catalog.
+- Naming a package/offer that exists in no catalog and attaching terms to it (a price, a "% off", a \
+  validity window) as though it were already live. If nothing in the catalog fits the moment, offer to \
+  DRAFT something instead -- never describe an invented product as running.
+- Promising a percentage discount at all. Service+price ("Haircut @ \u20b999") is both stronger copy and \
+  actually verifiable; "20% off" is generic, and if that percentage isn't in the context as a \
+  percentage it is a fabricated commercial term.
 - More than one question or call-to-action in the message.
+- Burying the ask. The call-to-action must be the LAST sentence. Do not append anything after it -- no \
+  "Also, don't forget ...", no extra offer mention, no sign-off fact. A graded recall message ended \
+  "... Which works for you? Also, don't forget our Dental Cleaning offer at 299." and threw away both \
+  the offer (it belonged in the body, before the ask) and the clean single close.
 - Ignoring the specified lever/CTA type for this trigger kind.
 - Medical/legal/financial claims, guarantees, or anything on the banned-phrase list.
 - Writing in the wrong language for the merchant's stated preference.
@@ -317,6 +341,19 @@ specific about your reasoning, never generic filler like "personalized message f
 """
 
 
+def _greeting_name_for_prompt(merchant_payload: dict) -> str:
+    """Imported lazily to avoid a circular import (fallback imports nothing
+    from this module, but composer imports both and fallback is the heavier
+    module). Never raises -- a missing name degrades to a neutral opener
+    rather than failing prompt construction."""
+    try:
+        from fallback import _merchant_greeting_name
+
+        return _merchant_greeting_name(merchant_payload or {})
+    except Exception:
+        return "there"
+
+
 def build_user_message(
     category: str,
     merchant_payload: dict,
@@ -334,19 +371,83 @@ def build_user_message(
         f"CATEGORY: {category}",
         _voice_line(style),
         f"MERCHANT CONTEXT (JSON, only source of merchant facts): {json.dumps(merchant_payload)}",
+        # Computed here rather than left to the model. The judge's own scoring
+        # prompt states the honorific rule for clinical categories outright,
+        # and every dentist case-study anchor uses it -- but a graded message
+        # opened "Bharat," to the owner of Bharat Dental Care, because nothing
+        # told the model which form to use and the business name carried no
+        # "Dr." to copy. This is the same string the deterministic templates
+        # use, so both paths now greet identically.
+        f"ADDRESS THE MERCHANT AS: {_greeting_name_for_prompt(merchant_payload)} "
+        "(use exactly this form -- not the business name, not a bare \"Hi\")",
         f"TRIGGER (why you're messaging now): {json.dumps(trigger)}",
         f"REQUIRED LEVER FOR THIS TRIGGER: {strategy.lever}",
         f"REQUIRED CTA TYPE FOR THIS TRIGGER: {strategy.cta}",
         "DECISION OUTPUT REQUIREMENT: give a grounded recommendation, starter artifact, or concrete next action before the CTA; do not merely restate the trigger and ask permission.",
     ]
+    # Naming the required figures explicitly, per call, rather than relying on
+    # the general rule in the system prompt. Stating the rule abstractly was
+    # not enough: the dentist research_digest draft kept paraphrasing "38%
+    # lower caries recurrence" into "outperforms 6-month", failed the gate
+    # twice, and fell through to the deterministic template -- so the fix for
+    # a dropped figure was costing the message its LLM wording. A concrete
+    # must-include list gets it right on the first draft instead.
+    required_figures = extract_hard_figures(trigger.get("fact") if isinstance(trigger, dict) else None)
+    if required_figures:
+        parts.append(
+            "FIGURES THAT MUST APPEAR IN YOUR MESSAGE BODY (already verified against the context; "
+            "this is checked mechanically and a message missing any of them is discarded): "
+            + ", ".join(required_figures)
+            + ". Use them in the fact's own units and framing, and build the sentence around them "
+            "rather than mentioning them in passing."
+        )
+    # The merchant's own live offers, stated separately and unambiguously.
+    # This is the fix for the single most common grounding failure in the
+    # graded runs: the category payload below contains an `offer_catalog` of
+    # ready-made titles for the whole vertical ("Free Consultation", "Free
+    # Delivery > 500"), and it used to be dumped inside a JSON blob labelled
+    # only "peer stats, digest, seasonal/trend data; only source of
+    # category-level facts". Nothing told the model those were not this
+    # merchant's products, so it reached into them whenever the merchant had
+    # nothing citable of their own -- and its own rationale came back saying
+    # "as per the category offer catalog". It was not hallucinating; it was
+    # copying a real string out of context it had been told was authoritative.
+    own_offers = normalize_merchant_offers(merchant_payload)
+    if own_offers:
+        parts.append(
+            "THIS MERCHANT'S OWN LIVE OFFERS -- the ONLY offers you may present as theirs, "
+            "available, or bookable: "
+            + "; ".join(o.get("raw_title") or o.get("name", "") for o in own_offers)
+        )
+    else:
+        parts.append(
+            "THIS MERCHANT HAS NO ACTIVE OFFERS AT ALL. Do not name any offer as theirs, available, "
+            "or bookable -- there is nothing to book. You may still propose CREATING one (\"want me "
+            "to set up ...?\"), and you may cite what this category typically charges as an explicit "
+            "benchmark (\"peers here run Dental Cleaning @ 299\"), but never as something they "
+            "already have."
+        )
     if category_payload:
         # peer_stats / seasonal_beats / trend_signals / digest give the
         # model real category-level benchmarks and citable research items
         # beyond the static tone/banned_phrases already folded into style.
+        # offer_catalog is pulled OUT of this blob and relabelled below --
+        # left inside it, it reads as a list of things this merchant sells.
+        category_for_prompt = {k: v for k, v in category_payload.items() if k != "offer_catalog"}
         parts.append(
             f"CATEGORY CONTEXT (JSON -- peer stats, digest, seasonal/trend data; only source of "
-            f"category-level facts): {json.dumps(category_payload)}"
+            f"category-level facts): {json.dumps(category_for_prompt)}"
         )
+        catalog = normalize_category_offer_catalog(category_payload)
+        if catalog:
+            parts.append(
+                "CATEGORY OFFER TEMPLATES -- these are generic price patterns every business in this "
+                "vertical sees. They are NOT this merchant's offers. Use them only to judge what a "
+                "sensible price/format looks like, or to quote as a peer benchmark you attribute to "
+                "the category. Never write \"your\", \"our\", \"available\", or \"book now\" about "
+                "one of these: "
+                + "; ".join(o.get("raw_title") or o.get("name", "") for o in catalog)
+            )
     if customer_payload:
         parts.append(
             f"CUSTOMER CONTEXT (you are messaging this customer, not the merchant): {json.dumps(customer_payload)}"
@@ -354,6 +455,19 @@ def build_user_message(
         parts.append(
             "CUSTOMER CTA EXCEPTION: keep the required customer booking/recall CTA shape even if a relevant offer is cited; do not force binary yes/no."
         )
+        # Stated as its own instruction because the general "match the language
+        # preference" rule was being read as the MERCHANT's preference even on
+        # customer-facing sends. Priya's own pref is "hi-en mix" and the graded
+        # recall message went out in pure English; the case-study anchor for
+        # that exact tuple is Hinglish.
+        pref = (customer_payload.get("identity") or {}).get("language_pref")
+        if isinstance(pref, str) and pref.strip():
+            parts.append(
+                f"LANGUAGE FOR THIS MESSAGE: this customer's own stated preference is "
+                f"\"{pref}\". Write in that. If it is a Hindi-English mix, genuinely mix them in "
+                "natural Hinglish -- whole clauses in each, not one English sentence with a Hindi "
+                "word bolted on."
+            )
     else:
         parts.append("CUSTOMER CONTEXT: none -- you are messaging the merchant directly.")
     parts.append(
@@ -377,6 +491,19 @@ tone, banned phrases, and Hinglish-if-requested still applies exactly. The diffe
   own words before adding anything new.
 - You were told the ORIGINAL TRIGGER/OFFER this thread started from (if any). Ground your reply in \
   that same fact/offer wherever it's still relevant -- do not switch topics.
+- Every rule about offers from the main prompt applies here too, and replies have been the worst \
+  offender in practice. Only the merchant's OWN live offers may be described as theirs, available, or \
+  bookable. A graded reply to a dentist whose single offer is "Dental Cleaning @ 299" ended "Book now \
+  for a free consultation!" -- an offer that exists only as a generic template for the vertical. If \
+  nothing of theirs fits, offer to set something up instead of inventing something to book.
+- A reply is scored on the same rubric as an opening message: it needs a real number, price, date or \
+  named offer from the context. "Got it, let me know how you'd like to proceed" scores near zero on \
+  specificity. Carry one concrete fact into every reply.
+- Never write promotional/advertising copy at a merchant. A graded reply sent a dentist "Unlock your \
+  brightest smile with our advanced teeth whitening treatments! Say goodbye to stains and hello to \
+  confidence." with hashtags. You are talking TO the business owner as a peer, not writing their ad. \
+  If they asked you to draft customer-facing copy, label it clearly as the draft and keep your own \
+  voice around it peer-level.
 - If the classifier says this reply is OFF-TOPIC (e.g. a loan question, an unrelated support request), \
   do not attempt to answer that unrelated question at all. Politely decline in one short sentence and \
   redirect back to the original topic by name, using the real trigger fact/offer you were given if one \
@@ -391,6 +518,18 @@ tone, banned phrases, and Hinglish-if-requested still applies exactly. The diffe
   given, then end with exactly one low-effort follow-up question. If they asked something the context \
   doesn't answer, say so honestly in one clause and pivot to what you can actually help with from the \
   context -- never invent an answer.
+- If the classifier says this is a GENERIC reply, they said something ordinary and on-topic that isn't \
+  a clear yes, a question, or a refusal ("ok", "thanks", "noted", "sounds interesting", "hmm"). Do NOT \
+  treat this as nothing. Acknowledge it in a few words, then move the thread forward one concrete step \
+  using the real trigger fact/offer you were given -- restate the single most useful specific number or \
+  fact from the context and ask exactly one low-effort binary question. Never repeat your previous \
+  message; add the next piece of value instead.
+- If the classifier says this is HOSTILE, they were rude or dismissive but did NOT ask you to stop. \
+  Stay on-mission and stay polite: do not argue, do not grovel with a long apology, do not lecture \
+  them, and do not end the conversation yourself. Acknowledge their frustration in one short clause, \
+  re-anchor on the one concrete fact that made this worth messaging about, and give them an explicit \
+  easy way out (they can reply STOP) so the reply is respectful rather than pushy. Maximum two short \
+  sentences.
 - If CUSTOMER CONTEXT is present, the person you're replying to IS that customer, not the merchant -- \
   address them by their own name, never surface merchant-internal analytics to them, match their own \
   language preference, and keep the same merchant-on-behalf voice rules as the main system prompt.

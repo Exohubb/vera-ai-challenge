@@ -61,6 +61,136 @@ def _digest_fact(item: dict) -> str:
     return " ".join(parts).strip()
 
 
+_EFFECT_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_PERCENT_IN_TEXT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
+# Words that begin a trailing qualifier rather than the thing being measured.
+_EFFECT_CLAUSE_STOP_WORDS = {
+    "with", "in", "vs", "versus", "than", "among", "compared", "across",
+    "for", "when", "after", "before", "during", "over", "at",
+}
+_EFFECT_CLAUSE_MAX_WORDS = 6
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _clock_label(value) -> str | None:
+    """"2026-04-18T19:30:00+05:30" -> "7:30pm".
+
+    The raw tail of the ISO timestamp was going straight into merchant copy as
+    "starts 19:30:00+05:30" -- a UTC offset in a WhatsApp message reads as
+    internal plumbing, and the rubric docks exposing internal jargon to the
+    merchant. Returns None rather than guessing when the value has no parseable
+    time, so the fact simply omits it (the fabricated-clock-time gate would
+    reject an invented one anyway)."""
+    if not value:
+        return None
+    text = str(value)
+    time_part = text.split("T")[-1] if "T" in text else text
+    time_part = time_part.split("+")[0].split("Z")[0].strip()
+    bits = time_part.split(":")
+    if len(bits) < 2:
+        return None
+    try:
+        hour, minute = int(bits[0]), int(bits[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    suffix = "am" if hour < 12 else "pm"
+    display_hour = hour % 12 or 12
+    return f"{display_hour}:{minute:02d}{suffix}" if minute else f"{display_hour}{suffix}"
+
+
+def _event_day_label(value) -> str | None:
+    """"2026-05-02T19:00:00+05:30" -> "May 2". Returns a human day label rather
+    than the raw ISO string: a merchant-facing message says "on May 2", and a
+    fact phrased the way the message should read survives paraphrasing far
+    better than one the model has to reformat. Year is omitted deliberately --
+    it is noise in a message about something happening this season."""
+    if not value:
+        return None
+    text = str(value).split("T")[0]
+    parts = text.split("-")
+    if len(parts) < 3:
+        return None
+    try:
+        month, day = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    if not 1 <= month <= 12:
+        return None
+    return f"{_MONTHS[month - 1]} {day}"
+
+
+# Deliberately NOT extracting the speaker name from the summary, though it is
+# a genuine specificity anchor ("Speaker: Dr. R. Mehta."). Every cheap way to
+# bound the name mis-slices on the abbreviation periods -- "Dr. R. Mehta"
+# truncates to "Dr" on a stop-at-first-period rule, and to "Dr. R" on a
+# next-sentence lookahead, because "Mehta." is indistinguishable from a
+# sentence start. A fact that says "speaker Dr" is worse than no speaker at
+# all, and the model already receives the full digest payload and can pull the
+# name itself. The resolved fact's job is to guarantee the anchors that were
+# being dropped, not to restate everything in the payload.
+
+
+def _digest_effect_clause(item: dict) -> str | None:
+    """Pulls the quantified-effect sentence out of a digest item's summary.
+
+    Digest items keep the headline in `title` and the actual magnitude of the
+    finding in `summary`. For the dentist research item the real dataset has:
+
+        title:   "3-month fluoride varnish recall outperforms 6-month for
+                  high-risk adult caries"
+        summary: "Multi-center Indian trial shows 38% lower caries recurrence
+                  with 3-month vs 6-month recall in adults with active decay
+                  history. No effect in low-risk patients."
+
+    The resolved fact was built from title + source + trial_n only, so the
+    single most persuasive number in the whole item -- the 38% -- never
+    reached the prompt at all, and could not possibly appear in the composed
+    message. challenge-brief.md Appendix A composes this exact scenario as
+    its gold standard and lists '"38% better"' among the three reasons the
+    message scores well, so dropping it was leaving the brief's own stated
+    top mark on the table.
+
+    Returns a compact verbatim clause: the percentage plus the words that
+    describe what it measures ("38% lower caries recurrence"). Two reasons not
+    to return the whole sentence:
+      - The title already states the finding qualitatively, so the full
+        sentence repeats it, and a fact that says the same thing twice makes
+        both the prompt and the deterministic fallback body wordier for no
+        added information.
+      - Every word returned here is verbatim from the summary, so the clause
+        cannot distort the finding and every number in it stays traceable to
+        the pushed context for the numeric-verification gate.
+    The trailing qualifiers that get cut ("in adults with active decay
+    history") are not lost -- `patient_segment` carries the cohort into the
+    fact separately.
+
+    Returns None when the summary carries no quantified effect, which leaves
+    those items' facts exactly as they were.
+    """
+    summary = item.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    for sentence in _EFFECT_SENTENCE_SPLIT_RE.split(summary.strip()):
+        match = _PERCENT_IN_TEXT_RE.search(sentence)
+        if not match:
+            continue
+        words = sentence[match.start():].split()
+        kept = [words[0]] if words else []
+        for word in words[1:_EFFECT_CLAUSE_MAX_WORDS]:
+            if word.strip(".,;:").lower() in _EFFECT_CLAUSE_STOP_WORDS:
+                break
+            kept.append(word)
+            if word.endswith((".", ",", ";", ":")):
+                break
+        clause = " ".join(kept).strip().rstrip(".,;:")
+        return clause or None
+    return None
+
+
 # Merchant performance field -> matching category peer_stats field, in
 # priority order. Used as a social-proof/specificity fallback for trigger
 # kinds that carry no event-specific fact of their own (dormant_with_vera,
@@ -330,8 +460,20 @@ def _f_research_digest(p: dict, category_payload, merchant_payload, customer_pay
     if item:
         summary = item.get("summary")
         base = _digest_fact(item)
+        # The quantified effect is the strongest thing in the item; carry it
+        # into the fact ahead of the cohort detail so it can't be the part
+        # that gets squeezed out. See _digest_effect_clause.
+        effect = _digest_effect_clause(item)
+        details = []
+        if effect:
+            details.append(effect)
         if item.get("trial_n") and item.get("patient_segment"):
-            return f"{base} -- {_fmt_num(item['trial_n'])}-patient trial, {item['patient_segment'].replace('_', ' ')} segment"
+            details.append(
+                f"{_fmt_num(item['trial_n'])}-patient trial, "
+                f"{item['patient_segment'].replace('_', ' ')} segment"
+            )
+        if base and details:
+            return f"{base} -- " + "; ".join(details)
         return base or summary
     return None
 
@@ -341,15 +483,35 @@ def _f_regulation_change(p: dict, category_payload, merchant_payload, customer_p
     base = _digest_fact(item) if item else None
     deadline = p.get("deadline_iso")
     if base and deadline:
-        return f"{base}, effective {deadline.split('T')[0]}"
+        day = deadline.split("T")[0]
+        # The digest title for this item already reads "DCI revised radiograph
+        # dose limits effective 2026-12-15", so appending the deadline produced
+        # "... effective 2026-12-15 (circular 2026-11-04), effective
+        # 2026-12-15" -- the same date stated twice in one fact. Harmless to a
+        # gate, but it is sloppy input to the prompt and it showed up verbatim
+        # in the deterministic fallback body.
+        if day not in base:
+            return f"{base}, effective {day}"
     return base
 
 
 def _f_cde_opportunity(p: dict, category_payload, merchant_payload, customer_payload) -> str | None:
-    item = _digest_item(category_payload, p.get("digest_item_id"))
+    item = _digest_item(category_payload, p.get("digest_item_id")) or {}
     base = _digest_fact(item) if item else None
     details = []
-    credits = p.get("credits")
+    # The event DATE is the "why now" for a CDE invite and it was being left
+    # out of the fact entirely, even though the digest item carries it. T06
+    # rolled two ways on the same build for exactly this reason: one draft
+    # happened to pull "on May 2" and the speaker/product detail straight out
+    # of the raw digest payload and scored 48/50, another ignored the payload
+    # and scored 29/50 with the judge noting it "misses concrete dates or
+    # stronger anchors". Putting the date in the resolved fact makes the
+    # anchor part of the brief instead of a lucky roll -- the same reasoning
+    # as the quantified-effect fix in _f_research_digest.
+    event_date = _event_day_label(item.get("date") or p.get("date"))
+    if event_date:
+        details.append(f"on {event_date}")
+    credits = p.get("credits") or item.get("credits")
     if credits is not None:
         details.append(f"{_fmt_num(credits)} CDE credits")
     fee = p.get("fee")
@@ -429,7 +591,17 @@ def _f_recall_due(p: dict, category_payload, merchant_payload, customer_payload)
         if labels:
             base += f", slots: {' or '.join(labels)}"
         return base
-    return None
+    # Placeholder recall_due, same gap that _f_customer_lapsed_soft already
+    # covers. Measured on T29 (Zen Yoga / Diya): payload was the bare
+    # {"placeholder": true} shape, this resolver returned None, and the
+    # composed message degraded to "Your follow-up is due. What time works
+    # for you?" -- 10/50, with the judge noting it "ignores the specific
+    # customer's history (9 past visits, last visit April 1) and could be
+    # copy-pasted to any business". That history was sitting right there in
+    # the customer payload the whole time. A recall message to a customer
+    # with no recall detail in the trigger is exactly the case where the
+    # relationship IS the fact.
+    return _derived_customer_fact(customer_payload)
 
 
 def _f_renewal_due(p: dict, *_) -> str | None:
@@ -525,12 +697,20 @@ def _f_ipl_match_today(p: dict, *_) -> str | None:
         base = f"{match} today"
         if venue:
             base += f" at {venue}"
-        if match_time:
-            base += f", starts {str(match_time).split('T')[-1]}"
+        clock = _clock_label(match_time)
+        if clock:
+            base += f", starts {clock}"
+        # The weeknight flag needs its CONSEQUENCE spelled out, not just its
+        # value. With a bare ", not a weeknight" the model kept writing the
+        # self-contradicting "it's not a weeknight, so push your Tue-Thu offer
+        # today" -- it had the fact and drew the opposite conclusion from it.
+        # This trigger's whole point (challenge-brief case study 5) is
+        # contrarian judgment: the right move on a weekend match is to hold the
+        # weekday offer back, not to fire it.
         if p.get("is_weeknight") is False:
-            base += ", not a weeknight"
+            base += ", NOT a weeknight -- weekend match nights convert worse, so the judgement call is to hold a weekday-only offer back for an upcoming weeknight match rather than push it today"
         elif p.get("is_weeknight") is True:
-            base += ", on a weeknight"
+            base += ", on a weeknight -- the strong slot for a match-night push"
         return base
     return None
 

@@ -45,14 +45,24 @@ load_dotenv()
 from category_styles import get_category_style, violates_banned_phrases
 from fact_check import (
     count_ctas,
+    find_content_after_cta,
+    find_dropped_grounded_figures,
     find_fabricated_clock_times,
+    find_missing_hinglish,
     find_new_customer_offer_mismatch,
     find_unsupported_appointment_assertion,
     find_urls,
     verify_numeric_claims,
 )
 from fallback import compose_fallback, compose_reply_grounded_fallback
-from offers import find_category_offer_leakage, format_offer, normalize_merchant_offers, select_relevant_offer
+from offers import (
+    find_category_offer_leakage,
+    find_invented_offer_names,
+    find_unsupported_discount_claims,
+    format_offer,
+    normalize_merchant_offers,
+    select_relevant_offer,
+)
 from state_backend import StateBackend
 from trigger_router import get_strategy
 from vera_persona import (
@@ -327,7 +337,52 @@ def _offer_is_cited(body: str, offer: dict) -> bool:
     return name_hit and price_hit
 
 
-def _expected_cta(strategy, trigger_kind: str, offer_cited: bool, is_customer_facing: bool = False) -> str:
+_CHOICE_LIST_FIELDS = ("available_slots", "next_session_options", "slot_options", "options", "choices")
+
+
+def _recipient_language_pref(merchant_payload: dict | None, customer_payload: dict | None) -> str | None:
+    """The RECIPIENT's language preference for find_missing_hinglish.
+
+    For a customer-facing message the recipient is the customer, so their own
+    identity.language_pref decides -- not the merchant's language list. This
+    mirrors the same fix already made in fallback.py's template path
+    (_is_hinglish taking an optional customer_payload); this is the same rule
+    applied on the LLM path, mechanically instead of as a prompt instruction
+    the model could ignore.
+    """
+    if customer_payload is not None:
+        pref = (customer_payload.get("identity") or {}).get("language_pref")
+        if isinstance(pref, str) and pref.strip():
+            return pref
+        return None
+    langs = (merchant_payload.get("identity") or {}).get("languages") if isinstance(merchant_payload, dict) else None
+    if isinstance(langs, list) and "hi" in langs:
+        return "hi-en mix"
+    return None
+
+
+def _has_choice_set(trigger_payload: dict | None) -> bool:
+    """True when the context actually contains a set of concrete choices a
+    multi_choice CTA could offer (labelled slots, session options)."""
+    if not isinstance(trigger_payload, dict):
+        return False
+    for field in _CHOICE_LIST_FIELDS:
+        value = trigger_payload.get(field)
+        if isinstance(value, list) and any(
+            (isinstance(v, dict) and (v.get("label") or v.get("time"))) or (isinstance(v, str) and v.strip())
+            for v in value
+        ):
+            return True
+    return False
+
+
+def _expected_cta(
+    strategy,
+    trigger_kind: str,
+    offer_cited: bool,
+    is_customer_facing: bool = False,
+    choice_set_available: bool = True,
+) -> str:
     """The strategy table's default CTA per trigger kind is right most of
     the time, but a citable offer changes the shape of the ask for
     MERCHANT-facing messages: once a concrete priced offer is on the
@@ -341,9 +396,23 @@ def _expected_cta(strategy, trigger_kind: str, offer_cited: bool, is_customer_fa
     multi_choice (pick-a-slot), which is the correct shape for a
     booking/recall ask even with a priced offer in the message -- forcing
     binary_yes_no there would be a decision-quality regression, not an
-    improvement."""
+    improvement.
+
+    Second override: never mandate a CTA shape the context cannot support.
+    The table's CTA for recall_due is multi_choice ("pick Wed 6pm or Thu 5pm"),
+    which is right when the trigger carries real slots -- and impossible when
+    it doesn't. Measured on T29: the trigger payload was the bare placeholder
+    shape with no slots at all, Nova correctly wrote an open_ended ask, the
+    gate rejected it for not being multi_choice, the retry was rejected the
+    same way, and the message fell through to a template that scored 10/50.
+    The only way to satisfy that demand would have been to invent slot times,
+    which a different gate exists to prevent. So when there is no choice set
+    to offer, degrade to a binary ask if a real offer is on the table, else an
+    open-ended one."""
     if trigger_kind in OFFER_CITATION_REQUIRED_KINDS and offer_cited and not is_customer_facing:
         return "binary_yes_no"
+    if strategy.cta == "multi_choice" and not choice_set_available:
+        return "binary_yes_no" if offer_cited else "open_ended"
     return strategy.cta
 
 
@@ -363,11 +432,40 @@ def _evaluate_draft(
     descriptions (empty list = draft passes everything)."""
     problems: list[str] = []
 
+    missing_hinglish = find_missing_hinglish(
+        body_text, _recipient_language_pref(merchant_payload, customer_payload)
+    )
+    if missing_hinglish:
+        problems.append(
+            "The recipient's stated language preference calls for a Hindi-English mix, but your "
+            "message is pure English with no Hindi-in-Latin-script words at all (e.g. aap/aapka, "
+            "kya, hai, karo, chahiye). Rewrite genuinely mixing Hindi and English clauses -- not one "
+            "English sentence with a single Hindi word bolted on."
+        )
+
     valid, unverifiable = verify_numeric_claims(body_text, merchant_payload, trigger, customer_payload, category_payload)
     if not valid:
         problems.append(
             f"These numbers appear in your message but not verbatim anywhere in the given context: "
             f"{', '.join(unverifiable)}. Remove or replace them with only numbers present in the context."
+        )
+
+    # The mirror image of the check above. verify_numeric_claims stops the
+    # model inventing numbers; this stops it silently discarding the ones the
+    # fact resolver already went and grounded. Both halves are needed --
+    # without this one, a message can pass every gate while paraphrasing away
+    # the single most persuasive figure available to it (measured: the
+    # dentist research_digest scenario the brief itself uses as its gold
+    # standard dropped "38%" and "2,100-patient" in 4 of 4 runs).
+    dropped_figures = find_dropped_grounded_figures(
+        body_text, trigger.get("fact") if isinstance(trigger, dict) else None
+    )
+    if dropped_figures:
+        problems.append(
+            f"The verified fact for this trigger contains hard figures ({', '.join(dropped_figures)}) "
+            "that your message left out. These are already grounded in the pushed context and they "
+            "are the most persuasive part of the message -- state them explicitly rather than "
+            "paraphrasing them into a vague claim, keeping the same units and framing the fact uses."
         )
 
     fabricated_times = find_fabricated_clock_times(body_text, merchant_payload, trigger, customer_payload)
@@ -432,6 +530,29 @@ def _evaluate_draft(
             "catalog, or don't cite a specific priced offer at all."
         )
 
+    invented_offers = find_invented_offer_names(body_text, merchant_payload, category_payload)
+    if invented_offers:
+        problems.append(
+            f"Your message presents {', '.join(repr(o) for o in invented_offers)} as an existing "
+            "offer/package with terms attached, but no offer by that name exists in this merchant's "
+            "own offers list or in the category offer catalog -- you invented the product. Either "
+            "cite an offer that actually exists in their catalog, or, if none fits, OFFER TO CREATE "
+            "one instead of describing it as if it were already live (e.g. 'want me to draft a "
+            "festive package?')."
+        )
+
+    unsupported_discounts = find_unsupported_discount_claims(
+        body_text, merchant_payload, category_payload, trigger, customer_payload
+    )
+    if unsupported_discounts:
+        problems.append(
+            f"Your message promises a discount ({', '.join(unsupported_discounts)}) that appears "
+            "nowhere in the context as a percentage. A bare digit turning up somewhere in a payload "
+            "does not make a discount real. Remove the discount entirely and cite the merchant's "
+            "actual service+price offer instead -- a concrete price is stronger copy than a percentage "
+            "anyway."
+        )
+
     offer_cited = _offer_is_cited(body_text, offer) if offer is not None else False
     if trigger_kind in OFFER_CITATION_REQUIRED_KINDS and offer is not None and not offer_cited:
         problems.append(
@@ -441,11 +562,23 @@ def _evaluate_draft(
         )
 
     raw_cta = raw_cta_hint
-    expected_cta = _expected_cta(get_strategy(trigger_kind), trigger_kind, offer_cited, is_customer_facing)
+    expected_cta = _expected_cta(
+        get_strategy(trigger_kind), trigger_kind, offer_cited, is_customer_facing,
+        _has_choice_set(trigger.get("payload") if isinstance(trigger, dict) else None),
+    )
     if raw_cta is not None and raw_cta != expected_cta:
         problems.append(
             f"You used cta='{raw_cta}' but this situation requires cta='{expected_cta}' "
             f"({'a citable offer exists, so the ask should be a direct yes/no' if expected_cta == 'binary_yes_no' else 'per the required CTA type for this trigger'})."
+        )
+
+    trailing = find_content_after_cta(body_text)
+    if trailing:
+        problems.append(
+            f"Your call-to-action is not the last thing in the message -- this comes after it: "
+            f"{'; '.join(repr(t) for t in trailing)}. The ask must be the final sentence. Move that "
+            "content earlier in the message (before the ask) or cut it; do not append an extra "
+            "offer mention or afterthought once you've asked."
         )
 
     cta_count = count_ctas(body_text)
@@ -459,12 +592,19 @@ def _evaluate_draft(
     return problems
 
 
-def _finalize_llm_result(raw: dict, strategy, trigger_kind: str, offer: dict | None, is_customer_facing: bool = False) -> dict:
+def _finalize_llm_result(
+    raw: dict,
+    strategy,
+    trigger_kind: str,
+    offer: dict | None,
+    is_customer_facing: bool = False,
+    choice_set_available: bool = True,
+) -> dict:
     rationale = raw.get("rationale") or f"{trigger_kind} trigger -> {strategy.lever} lever"
     if offer is None and "\u20b9" not in raw["body"] and "offer" not in rationale.lower():
         rationale += " (no matching offer in catalog, no price cited)"
     offer_cited = _offer_is_cited(raw["body"], offer) if offer is not None else False
-    final_cta = _expected_cta(strategy, trigger_kind, offer_cited, is_customer_facing)
+    final_cta = _expected_cta(strategy, trigger_kind, offer_cited, is_customer_facing, choice_set_available)
     return {
         "body": _strip_lone_surrogates(raw["body"]),
         "cta": final_cta,
@@ -541,11 +681,22 @@ def compose(
 def _try_llm_with_correction(category, merchant_payload, trigger, customer_payload, style, strategy, trigger_kind, offer, category_payload=None) -> tuple[dict | None, str | None]:
     """Return ``(accepted_result, fallback_reason)``. A transient first
     failure stops immediately to avoid multiplying a throttle burst."""
+    choice_set_available = _has_choice_set(
+        trigger.get("payload") if isinstance(trigger, dict) and isinstance(trigger.get("payload"), dict) else None
+    )
     try:
         user_message = build_user_message(category, merchant_payload, trigger, strategy, style, customer_payload, category_payload)
-        effective_cta = _expected_cta(strategy, trigger_kind, offer is not None, customer_payload is not None)
+        effective_cta = _expected_cta(
+            strategy, trigger_kind, offer is not None, customer_payload is not None, choice_set_available
+        )
         if effective_cta != strategy.cta:
-            user_message += f"\n\nEFFECTIVE CTA OVERRIDE FOR THIS MESSAGE: {effective_cta} (a semantically relevant merchant offer was selected)."
+            reason = (
+                "no concrete choice set (slots/options) exists in the context, so a multi_choice ask "
+                "would require inventing options"
+                if strategy.cta == "multi_choice" and not choice_set_available
+                else "a semantically relevant merchant offer was selected"
+            )
+            user_message += f"\n\nEFFECTIVE CTA OVERRIDE FOR THIS MESSAGE: {effective_cta} ({reason})."
     except Exception as exc:
         logger.error("failed to build Nova prompt from context (%s), skipping LLM path", exc)
         return None, "quality"
@@ -567,7 +718,9 @@ def _try_llm_with_correction(category, merchant_payload, trigger, customer_paylo
                 category_payload,
             )
             if not problems:
-                return _finalize_llm_result(raw, strategy, trigger_kind, offer, customer_payload is not None), None
+                return _finalize_llm_result(
+                    raw, strategy, trigger_kind, offer, customer_payload is not None, choice_set_available
+                ), None
             logger.info("Nova attempt %d failed quality gates: %s", attempt, problems)
 
         if attempt >= LLM_MAX_ATTEMPTS:
@@ -650,6 +803,14 @@ def _reply_cache_key(intent: str, incoming_message: str, merchant_payload: dict 
 
 def _evaluate_reply_draft(body_text: str, merchant_payload: dict | None, trigger_payload: dict | None, customer_payload: dict | None, style: dict, category_payload: dict | None = None) -> list[str]:
     problems: list[str] = []
+    missing_hinglish = find_missing_hinglish(
+        body_text, _recipient_language_pref(merchant_payload, customer_payload)
+    )
+    if missing_hinglish:
+        problems.append(
+            "The recipient's stated language preference calls for a Hindi-English mix, but your "
+            "reply is pure English. Rewrite genuinely mixing Hindi and English clauses."
+        )
     valid, unverifiable = verify_numeric_claims(body_text, merchant_payload, trigger_payload, customer_payload, category_payload)
     if not valid:
         problems.append(
@@ -679,6 +840,29 @@ def _evaluate_reply_draft(body_text: str, merchant_payload: dict | None, trigger
             f"Your reply cites {', '.join(leaked_offers)} as if it were this merchant's own live offer, "
             "but it's only a generic category-level template, not something in this merchant's own "
             "offers list. Remove it or cite an offer actually in their catalog."
+        )
+    invented_offers = find_invented_offer_names(body_text, merchant_payload, category_payload)
+    if invented_offers:
+        problems.append(
+            f"Your reply presents {', '.join(repr(o) for o in invented_offers)} as an existing "
+            "offer/package with terms attached, but no such offer exists in the merchant's catalog or "
+            "the category catalog. Cite a real offer, or offer to create one instead of describing it "
+            "as already live."
+        )
+    unsupported_discounts = find_unsupported_discount_claims(
+        body_text, merchant_payload, category_payload, trigger_payload, customer_payload
+    )
+    if unsupported_discounts:
+        problems.append(
+            f"Your reply promises a discount ({', '.join(unsupported_discounts)}) that appears nowhere "
+            "in the context as a percentage. Remove it and cite the merchant's actual service+price "
+            "offer instead."
+        )
+    trailing = find_content_after_cta(body_text)
+    if trailing:
+        problems.append(
+            f"Your ask is not the last thing in the reply -- this comes after it: "
+            f"{'; '.join(repr(t) for t in trailing)}. End on the ask."
         )
     cta_count = count_ctas(body_text)
     if cta_count > 1:

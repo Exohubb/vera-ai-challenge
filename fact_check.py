@@ -19,6 +19,80 @@ def _extract_numbers(text: str) -> set[str]:
     return {m.group(0).replace(",", "") for m in _NUMBER_RE.finditer(text)}
 
 
+# ---------------------------------------------------------------------------
+# Recipient language preference -- mechanical check
+# ---------------------------------------------------------------------------
+#
+# challenge-brief.md section 11 names "Ignoring the language preference ('hi-en
+# mix' merchant getting pure English)" as an anti-pattern, and it is checked
+# on the graded customer-facing recall pair specifically (Priya's own
+# language_pref is "hi-en mix"; the brief's own gold example for that exact
+# tuple is written in Hinglish). Stating this as a prompt rule was not
+# enough -- a real roll for that pair still came back in pure English despite
+# an explicit "write in this preference" instruction. Everything else that
+# turned out to be prompt-only and got ignored ended up as a gate instead
+# (dropped figures, buried CTA, invented offers); this is the same pattern.
+#
+# Detection deliberately uses the actual Hindi-in-Latin-script vocabulary this
+# codebase's own Hinglish templates use (aap/aapka/kya/hai/karo/chahiye/...),
+# not a generic "any non-ASCII word" heuristic -- WhatsApp Hinglish is written
+# in Latin script, so there's no script signal to key off, and English
+# borrowings that already read as English (offer, book, confirm, reply) must
+# not count as evidence of Hindi.
+_HINGLISH_WORDS = {
+    "aap", "aapka", "aapke", "aapki", "aapko", "aapse",
+    "hai", "hain", "ho", "hoga", "hogi", "hoon", "tha", "thi",
+    "kya", "kyun", "kyu", "kyunki", "kaisa", "kaise", "kaunsa", "kab",
+    "kar", "karo", "karein", "karenge", "karna", "karo", "karoon", "kardo",
+    "kar do", "kardo", "chahiye", "chahenge", "chahte", "chahti",
+    "doon", "dijiye", "dena", "dein", "denge", "bhej", "bheju", "bhejun",
+    "main", "mera", "mere", "meri", "hum", "humein", "hume", "humara",
+    "yeh", "woh", "iska", "uska", "iske", "uske", "jabki", "jaise",
+    "abhi", "abhi", "kal", "aaj", "hafte", "din", "mahine",
+    "namaste", "shukriya", "dhanyavaad", "theek", "accha", "achha",
+    "samajh", "gaya", "gayi", "raha", "rahe", "rahi", "milega", "milegi",
+    "wapas", "turant", "jaldi", "zaroor", "bilkul", "haan", "nahi", "nahin",
+    "yahan", "wahan", "batayein", "bata", "batao", "puchna",
+}
+
+_LATIN_WORD_RE = re.compile(r"[a-zA-Z]+")
+
+
+def is_hinglish_text(text: str) -> bool:
+    """True when `text` contains at least one recognizable Hindi-in-Latin-
+    script word. A single genuine Hindi word (not just an emoji or a proper
+    noun) is enough -- WhatsApp Hinglish is normally a real mix of clauses,
+    not a token sprinkled into otherwise-English prose, but requiring more
+    than one word risked missing short replies while requiring zero risked
+    nothing at all."""
+    if not isinstance(text, str) or not text:
+        return False
+    words = {w.lower() for w in _LATIN_WORD_RE.findall(text)}
+    return bool(words & _HINGLISH_WORDS)
+
+
+def find_missing_hinglish(body: str, recipient_language_pref: str | None) -> bool:
+    """True when the recipient's stated preference calls for a Hindi-English
+    mix and the composed body is pure English.
+
+    `recipient_language_pref` is either a customer's `identity.language_pref`
+    string (e.g. "hi-en mix") for a customer-facing message, or a simple
+    "hi"/"en" style marker built from the merchant's `identity.languages` list
+    for a merchant-facing one. Only a request for a MIX matters here -- a
+    recipient who only speaks Hindi is out of scope for this check, since the
+    dataset never actually gives a Hindi-only preference and forcing a
+    heuristic mixed-language gate to also validate pure-Hindi output would be
+    guessing past what's needed.
+    """
+    if not recipient_language_pref or not isinstance(body, str) or not body.strip():
+        return False
+    pref = recipient_language_pref.lower()
+    wants_mix = "hi" in pref and ("en" in pref or "mix" in pref or pref.strip() == "hi")
+    if not wants_mix:
+        return False
+    return not is_hinglish_text(body)
+
+
 def _extract_source_numbers(*sources: dict | list | str | None) -> set[str]:
     found: set[str] = set()
     for src in sources:
@@ -39,6 +113,98 @@ def verify_numeric_claims(body: str, *context_sources: dict | list | str | None)
     source_numbers = _extract_source_numbers(*context_sources)
     unverifiable = sorted(n for n in body_numbers if n not in source_numbers)
     return (len(unverifiable) == 0), unverifiable
+
+
+# ---------------------------------------------------------------------------
+# The other half of grounding: numbers that were RESOLVED and then dropped
+# ---------------------------------------------------------------------------
+#
+# verify_numeric_claims above is a one-sided check. It asks "is every number
+# in the message traceable to the context?" -- it never asks "did the message
+# actually use the specific figures we went to the trouble of resolving?"
+# Nothing anywhere required a grounded number to survive into the final body,
+# so the model was free to paraphrase the hard numbers out and still pass
+# every gate.
+#
+# That is exactly what happened on the single scenario the brief itself uses
+# as its gold standard. challenge-brief.md Appendix A composes the dentist
+# research_digest trigger and names the reason it scores well: '"2,100-
+# patient", "38% better", "JIDA Oct 2026 p.14"'. The fact resolver produces
+# a fact string carrying all of those. Across four controlled runs, "38%"
+# and "2,100" were absent from the final message every time -- the draft
+# said "a recent JIDA study found 3-month recall outperforms 6-month", which
+# is true, grounded, passes every gate, and throws away the entire
+# specificity advantage the resolver had already earned.
+#
+# So: extract the HARD figures from the resolved fact and require them in the
+# body. "Hard" is deliberately narrow, because over-reaching here would
+# damage good messages rather than help them:
+#   - percentages ("38%", "50%") -- almost always the headline claim
+#   - comma-grouped counts ("2,100", "2,410") -- unambiguously a magnitude,
+#     never a year or a date part
+#   - plain integers of 3+ digits and >= 100 ("188" days, "2410" views)
+# and just as deliberately EXCLUDES:
+#   - anything inside an ISO date (2026-12-15 must not force "2026" into a
+#     message whose natural phrasing is "before Dec 15")
+#   - bare 4-digit years (a customer-facing recall message should read "due
+#     12th Nov", not "due 2026")
+#   - anything under 100, which is where ordinary prose numbers live
+#     ("3-month", "6-mo", "p.14", "4 reviews", a "50 min" quote) and where
+#     forcing a match would produce stilted copy for no specificity gain
+_PERCENT_FIGURE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_GROUPED_COUNT_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{1,2}-\d{1,2}\b")
+_BARE_YEAR_RE = re.compile(r"(?:19|20)\d{2}")
+_PLAIN_INT_RE = re.compile(r"\b\d{3,}\b")
+
+
+def extract_hard_figures(fact: str | None) -> list[str]:
+    """Returns the figures in a resolved trigger fact that a good message is
+    expected to reproduce, in the order they appear. Empty list when the
+    fact carries no hard figure (many trigger kinds legitimately don't), in
+    which case the gate below is a no-op."""
+    if not isinstance(fact, str) or not fact:
+        return []
+    figures: list[str] = []
+    seen: set[str] = set()
+
+    def _add(token: str) -> None:
+        normalized = token.replace(",", "")
+        if normalized not in seen:
+            seen.add(normalized)
+            figures.append(token)
+
+    for match in _PERCENT_FIGURE_RE.finditer(fact):
+        _add(match.group(1))
+    for match in _GROUPED_COUNT_RE.finditer(fact):
+        _add(match.group(0))
+
+    # Plain integers are scanned against a residue with dates and already-
+    # counted grouped numbers blanked out, so "2026-12-15" can't leak a
+    # "2026" requirement and "2,100" isn't re-read as a bare "100".
+    residue = _GROUPED_COUNT_RE.sub(" ", _ISO_DATE_RE.sub(" ", fact))
+    for match in _PLAIN_INT_RE.finditer(residue):
+        token = match.group(0)
+        if _BARE_YEAR_RE.fullmatch(token):
+            continue
+        try:
+            if int(token) < 100:
+                continue
+        except ValueError:
+            continue
+        _add(token)
+
+    return figures
+
+
+def find_dropped_grounded_figures(body: str, fact: str | None) -> list[str]:
+    """Returns the hard figures present in the resolved fact but missing
+    from the message body. Empty list means the message kept them all."""
+    required = extract_hard_figures(fact)
+    if not required:
+        return []
+    body_numbers = _extract_numbers(body or "")
+    return [f for f in required if f.replace(",", "") not in body_numbers]
 
 
 _CLOCK_TIME_RE = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)\b|\b\d{1,2}:\d{2}\b")
@@ -106,6 +272,11 @@ def find_fabricated_clock_times(
     return sorted(t for t in times_in_body if _norm(t) not in blob_norm)
 
 
+# Sentence boundaries for ask-counting. Newlines count too: a CTA is
+# frequently split onto its own line with no terminal punctuation on the
+# line above it.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
 _IMPERATIVE_CTA_RE = re.compile(
     r"\breply\s+(\d|yes|no|stop|confirm)\b|\bwant me to\b|\blet me know\b",
     re.IGNORECASE,
@@ -127,6 +298,60 @@ def find_urls(body: str) -> list[str]:
     return _URL_RE.findall(body or "")
 
 
+# Discourse markers that introduce an appended extra after the ask. These are
+# what "buried CTA" actually looks like in practice.
+_APPENDED_EXTRA_RE = re.compile(
+    r"^\s*(?:also|and\b|plus\b|don'?t forget|by the way|btw|p\.?s\.?|additionally|"
+    r"one more thing|aur\b|bhi\b)",
+    re.IGNORECASE,
+)
+
+
+def find_content_after_cta(body: str) -> list[str]:
+    """Returns any substantive text that comes AFTER the call-to-action.
+
+    challenge-brief.md section 11 lists "Buried call-to-action (the 'what to
+    do' should land in the last sentence)" as an anti-pattern, and a graded
+    recall message ended:
+
+        "... Which works for you? Also, don't forget our Dental Cleaning
+         offer at 299."
+
+    That wastes the offer (it belonged in the body, before the ask) and blunts
+    the close. Stating the rule in the prompt was not enough -- the same
+    trailing sentence reappeared on a later roll -- so it is checked here.
+
+    Deliberately narrow, because the brief's OWN gold-standard message ends
+    with a trailing source citation after the CTA ("Want me to pull it + draft
+    a patient-ed WhatsApp you can share?  -- JIDA Oct 2026 p.14"). A short
+    attribution fragment is fine; a new sentence or an "Also, ..." aside is
+    not. Only text after the LAST ask is considered, so a mid-message question
+    is unaffected.
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(body or "") if s.strip()]
+    if not sentences:
+        return []
+    last_ask = -1
+    for i, sentence in enumerate(sentences):
+        if "?" in sentence or _IMPERATIVE_CTA_RE.search(sentence):
+            last_ask = i
+    if last_ask == -1 or last_ask == len(sentences) - 1:
+        return []
+
+    offenders = []
+    for sentence in sentences[last_ask + 1:]:
+        stripped = sentence.strip()
+        if _APPENDED_EXTRA_RE.match(stripped):
+            offenders.append(stripped)
+            continue
+        # A trailing attribution/citation fragment is allowed; a full sentence
+        # of new content is not.
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", stripped) if len(w) > 2]
+        if len(words) >= 5:
+            offenders.append(stripped)
+    return offenders
+
+
 def count_ctas(body: str) -> int:
     """Rough heuristic: count distinct asks. Most CTAs end in a question
     mark, but multi_choice booking/slot CTAs are often phrased as an
@@ -135,11 +360,29 @@ def count_ctas(body: str) -> int:
     one clear CTA). Count "?" as usual, but if there are none, check for
     an imperative CTA phrasing and count that as exactly one ask instead
     of zero -- otherwise a perfectly good multi_choice message fails the
-    "has no CTA" quality gate."""
-    q_count = body.count("?")
-    if q_count > 0:
-        return q_count
-    return 1 if _IMPERATIVE_CTA_RE.search(body) else 0
+    "has no CTA" quality gate.
+
+    The imperative check used to run ONLY when there were no question marks
+    at all, which left a hole big enough for a real double-ask to walk
+    through: a graded recall message ended "... Which slot works for you? ...
+    Reply 1 for Wed 5th Nov, 6pm, 2 for Thu 6th Nov, 5pm, or tell us a time
+    that works." That is two asks for the same decision -- one of
+    challenge-brief.md section 11's named anti-patterns -- and it passed
+    cleanly because the question count was exactly 1. Count question
+    sentences and imperative-CTA sentences separately so both are seen, but
+    never count the same sentence twice, which would have broken the
+    multi_choice gold example this heuristic was written for.
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(body or "") if s.strip()]
+    if not sentences:
+        return 0
+    count = 0
+    for sentence in sentences:
+        if "?" in sentence:
+            count += sentence.count("?")
+        elif _IMPERATIVE_CTA_RE.search(sentence):
+            count += 1
+    return count
 
 
 # Offer copy that is explicitly restricted to first-time / new customers.
